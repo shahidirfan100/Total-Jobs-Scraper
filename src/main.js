@@ -172,6 +172,7 @@ async function main() {
             proxyConfiguration: proxyConf,
             maxRequestRetries: 3,
             useSessionPool: true,
+            useHttp2: false,
             sessionPoolOptions: {
                 maxPoolSize: sessionPoolSize,
                 sessionOptions: {
@@ -184,6 +185,10 @@ async function main() {
             requestHandlerTimeoutSecs: 60,
             navigationTimeoutSecs: 30,
             maxRequestsPerMinute,
+            requestOptions: {
+                // Force HTTP/1.1 because TotalJobs intermittently closes HTTP/2 streams
+                http2: false,
+            },
             
             // Pre-navigation hook for stealth headers
             preNavigationHooks: [
@@ -444,14 +449,21 @@ async function main() {
             },
 
             // Error handling with smart retry
-            failedRequestHandler: async ({ request }, error) => {
+            failedRequestHandler: async ({ request, session }, error) => {
                 failedUrls.add(request.url);
-                const is403or429 = error.message.includes('403') || error.message.includes('429');
-                const isNetworkError = error.message.includes('NGHTTP2') || error.message.includes('socket') || error.message.includes('ECONNRESET');
+                const message = error?.message || '';
+                const is403or429 = message.includes('403') || message.includes('429');
+                const isHttp2Error = message.includes('NGHTTP2');
+                const isNetworkError = isHttp2Error || message.includes('socket') || message.includes('ECONNRESET');
                 
                 if (is403or429) {
                     log.warning(`Blocked on ${request.url} - rotating session`);
                     await randomDelay(blockDelay.min, blockDelay.max);
+                    session?.retire();
+                } else if (isHttp2Error) {
+                    log.debug(`HTTP/2 transport error on ${request.url}, retrying with new session.`);
+                    session?.retire();
+                    await randomDelay(blockDelay.min / 2, blockDelay.max / 2);
                 } else if (isNetworkError) {
                     log.debug(`Network error on ${request.url}: ${error.message}`);
                 } else {
