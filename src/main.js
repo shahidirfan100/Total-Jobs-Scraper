@@ -1,9 +1,9 @@
-// TotalJobs scraper - Production-ready implementation
+//TotalJobs scraper - Production-ready implementation
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 
-// Selector documentation based on actual Totaljobs.com structure (Nov 2025)
+// Selector documentation based on actualTotalJobs.com structure (Nov 2025)
 // LISTING PAGE: Job links found as: <a href="/job/[title]/[company]-job[id]">
 // Pattern: Links start with /job/ and contain job title, company slug, and job ID
 // Pagination: <a href="/jobs/admin?page=2"> (numbered pages 1-285+)
@@ -81,6 +81,18 @@ function getBackoffDelay(retryCount) {
   return Math.min(1000 * Math.pow(2, retryCount) + Math.random() * 1000, 10000);
 }
 
+function normalizeDelayRange(range, fallback) {
+  if (Array.isArray(range) && range.length === 2) {
+    const [rawMin, rawMax] = range.map((val) => Number(val));
+    if (Number.isFinite(rawMin) && Number.isFinite(rawMax)) {
+      const min = Math.max(0, Math.min(rawMin, rawMax));
+      const max = Math.max(min, Math.max(rawMin, rawMax));
+      return { min, max };
+    }
+  }
+  return fallback;
+}
+
 // Single-entrypoint main
 await Actor.init();
 
@@ -98,10 +110,30 @@ async function main() {
             url,
             proxyConfiguration,
             postedWithin,
+            maxConcurrency: inputMaxConcurrency,
+            minConcurrency: inputMinConcurrency,
+            maxRequestsPerMinute: inputMaxRpm,
+            navigationDelayRange,
+            listingDelayRange,
+            detailDelayRange,
+            blockDelayRange,
         } = input;
 
         const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : 100;
         const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 10;
+
+        const maxRequestsPerMinute = Number.isFinite(+inputMaxRpm) ? Math.max(90, +inputMaxRpm) : 220;
+        const maxConcurrency = Number.isFinite(+inputMaxConcurrency) ? Math.max(4, Math.min(24, +inputMaxConcurrency)) : 12;
+        const minConcurrency = Number.isFinite(+inputMinConcurrency)
+            ? Math.max(2, Math.min(+inputMinConcurrency, maxConcurrency))
+            : Math.max(3, Math.min(10, Math.floor(maxConcurrency / 2)));
+
+        const navDelay = normalizeDelayRange(navigationDelayRange, { min: 30, max: 120 });
+        const listDelay = normalizeDelayRange(listingDelayRange, { min: 120, max: 280 });
+        const detailDelay = normalizeDelayRange(detailDelayRange, { min: 220, max: 520 });
+        const blockDelay = normalizeDelayRange(blockDelayRange, { min: 1200, max: 2000 });
+
+        const sessionPoolSize = Math.max(30, maxConcurrency * 3);
 
         // Build start URL from keyword/location or use provided URL
         const buildStartUrl = (kw, loc, cat, posted) => {
@@ -110,7 +142,7 @@ async function main() {
             const u = new URL(base + (kw ? `/${encodeURIComponent(kw)}` : ''));
             if (loc) u.searchParams.set('Location', loc);
             if (cat) u.searchParams.set('Category', cat);
-            if (posted && [1, 3, 7].includes(Number(posted))) u.searchParams.set('postedWithin', posted);
+            if (posted && ['1', '3', '7'].includes(posted)) u.searchParams.set('postedWithin', posted);
             return u.href;
         };
 
@@ -121,6 +153,7 @@ async function main() {
 
         log.info(`TotalJobs scraper started with ${initial.length} start URL(s)`);
         log.info(`Target: ${RESULTS_WANTED} jobs, max ${MAX_PAGES} pages, collectDetails: ${collectDetails}`);
+        log.info(`Concurrency window: ${minConcurrency}-${maxConcurrency}, RPM limit: ${maxRequestsPerMinute}`);
 
         // Proxy configuration
         const proxyConf = proxyConfiguration
@@ -140,17 +173,17 @@ async function main() {
             maxRequestRetries: 3,
             useSessionPool: true,
             sessionPoolOptions: {
-                maxPoolSize: 20,
+                maxPoolSize: sessionPoolSize,
                 sessionOptions: {
-                    maxUsageCount: 10,
+                    maxUsageCount: 15,
                     maxErrorScore: 3,
                 },
             },
-            maxConcurrency: 5,
-            minConcurrency: 2,
+            maxConcurrency,
+            minConcurrency,
             requestHandlerTimeoutSecs: 60,
             navigationTimeoutSecs: 30,
-            maxRequestsPerMinute: 120,
+            maxRequestsPerMinute,
             
             // Pre-navigation hook for stealth headers
             preNavigationHooks: [
@@ -174,7 +207,7 @@ async function main() {
                     });
                     
                     // Small network delay
-                    await randomDelay(50, 200);
+                    await randomDelay(navDelay.min, navDelay.max);
                 },
             ],
 
@@ -191,7 +224,7 @@ async function main() {
                     }
 
                     // Quick delay
-                    await randomDelay(300, 800);
+                    await randomDelay(listDelay.min, listDelay.max);
 
                     // Find all job links: /job/[title]/[company]-job[id]
                     const jobLinks = [];
@@ -325,7 +358,7 @@ async function main() {
                     }
 
                     // Quick delay
-                    await randomDelay(400, 1000);
+                    await randomDelay(detailDelay.min, detailDelay.max);
 
                     const seed = request.userData?.seed || {};
 
@@ -403,7 +436,7 @@ async function main() {
                     if (record.title && record.job_url) {
                         await Dataset.pushData(record);
                         saved++;
-                        crawlerLog.info(`✓ Saved job #${saved}: ${record.title}`);
+                        crawlerLog.info(`Saved job #${saved}: ${record.title}`);
                     } else {
                         crawlerLog.warning(`Skipped incomplete job: ${request.url}`);
                     }
@@ -418,7 +451,7 @@ async function main() {
                 
                 if (is403or429) {
                     log.warning(`Blocked on ${request.url} - rotating session`);
-                    await randomDelay(2000, 4000);
+                    await randomDelay(blockDelay.min, blockDelay.max);
                 } else if (isNetworkError) {
                     log.debug(`Network error on ${request.url}: ${error.message}`);
                 } else {
@@ -429,7 +462,7 @@ async function main() {
 
         await crawler.run(initial);
 
-        log.info(`✅ TotalJobs scraper finished. Saved ${saved} jobs from ${pagesVisited} pages.`);
+        log.info(`✅TotalJobs scraper finished. Saved ${saved} jobs from ${pagesVisited} pages.`);
     } catch (error) {
         log.error(`Fatal error in main: ${error.message}`, { stack: error.stack });
         throw error;
