@@ -97,25 +97,27 @@ async function main() {
             startUrl,
             url,
             proxyConfiguration,
+            postedWithin,
         } = input;
 
         const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : 100;
         const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 10;
 
         // Build start URL from keyword/location or use provided URL
-        const buildStartUrl = (kw, loc, cat) => {
+        const buildStartUrl = (kw, loc, cat, posted) => {
             const base = 'https://www.totaljobs.com/jobs';
             if (!kw && !loc && !cat) return `${base}/admin`;
             const u = new URL(base + (kw ? `/${encodeURIComponent(kw)}` : ''));
             if (loc) u.searchParams.set('Location', loc);
             if (cat) u.searchParams.set('Category', cat);
+            if (posted && [1, 3, 7].includes(Number(posted))) u.searchParams.set('postedWithin', posted);
             return u.href;
         };
 
         const initial = [];
         if (startUrl) initial.push(startUrl);
         else if (url) initial.push(url);
-        else initial.push(buildStartUrl(keyword, location, category));
+        else initial.push(buildStartUrl(keyword, location, category, postedWithin));
 
         log.info(`TotalJobs scraper started with ${initial.length} start URL(s)`);
         log.info(`Target: ${RESULTS_WANTED} jobs, max ${MAX_PAGES} pages, collectDetails: ${collectDetails}`);

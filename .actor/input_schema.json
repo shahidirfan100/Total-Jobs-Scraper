@@ -23,12 +23,6 @@
       "description": "Location to filter results (leave empty for broad results).",
       "editor": "textfield"
     },
-    "category": {
-      "title": "Category (optional)",
-      "type": "string",
-      "description": "Optional job category to filter by (as used on Totaljobs).",
-      "editor": "textfield"
-    },
     "collectDetails": {
       "title": "Collect job details",
       "type": "boolean",
@@ -80,6 +74,14 @@
       "description": "Remove duplicate job URLs from results (in-memory deduplication).",
       "editor": "checkbox",
       "default": true
+    },
+    "postedWithin": {
+      "title": "Posted within (days)",
+      "type": "integer",
+      "description": "Filter jobs posted within the last N days. Leave empty for all jobs.",
+      "editor": "select",
+      "enum": [1, 3, 7],
+      "enumTitles": ["Last 24 hours", "Last 3 days", "Last 7 days"]
     }
   },
   "required": [],
