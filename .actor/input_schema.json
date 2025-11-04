@@ -54,6 +54,13 @@
       "editor": "number",
       "default": 20
     },
+        "maxConcurrency": {
+      "title": "Max concurrency",
+      "type": "integer",
+      "description": "Upper bound on parallel requests. Leave empty to use the fast default (12).",
+      "editor": "number",
+      "minimum": 1
+    },
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
@@ -82,75 +89,6 @@
       "description": "Remove duplicate job URLs from results (in-memory deduplication).",
       "editor": "checkbox",
       "default": true
-    },
-    "maxConcurrency": {
-      "title": "Max concurrency",
-      "type": "integer",
-      "description": "Upper bound on parallel requests. Leave empty to use the fast default (12).",
-      "editor": "number",
-      "minimum": 1
-    },
-    "minConcurrency": {
-      "title": "Min concurrency",
-      "type": "integer",
-      "description": "Lower bound on parallel requests (defaults to half of max). Leave empty for automatic tuning.",
-      "editor": "number",
-      "minimum": 1
-    },
-    "maxRequestsPerMinute": {
-      "title": "Max requests per minute",
-      "type": "integer",
-      "description": "Throttle outbound requests. Leave empty to use fast default (220 RPM).",
-      "editor": "number",
-      "minimum": 30
-    },
-    "navigationDelayRange": {
-      "title": "Navigation delay range (ms)",
-      "type": "array",
-      "description": "Two numbers [min, max] for the random delay before navigation (defaults to [30,120]).",
-      "editor": "array",
-      "items": {
-        "type": "integer",
-        "minimum": 0
-      },
-      "minItems": 2,
-      "maxItems": 2
-    },
-    "listingDelayRange": {
-      "title": "Listing delay range (ms)",
-      "type": "array",
-      "description": "Two numbers [min, max] for waits between listing page operations (defaults to [120,280]).",
-      "editor": "array",
-      "items": {
-        "type": "integer",
-        "minimum": 0
-      },
-      "minItems": 2,
-      "maxItems": 2
-    },
-    "detailDelayRange": {
-      "title": "Detail delay range (ms)",
-      "type": "array",
-      "description": "Two numbers [min, max] for waits on detail pages (defaults to [220,520]).",
-      "editor": "array",
-      "items": {
-        "type": "integer",
-        "minimum": 0
-      },
-      "minItems": 2,
-      "maxItems": 2
-    },
-    "blockDelayRange": {
-      "title": "Block delay range (ms)",
-      "type": "array",
-      "description": "Two numbers [min, max] for cooldowns after blocks/transport errors (defaults to [1200,2000]).",
-      "editor": "array",
-      "items": {
-        "type": "integer",
-        "minimum": 0
-      },
-      "minItems": 2,
-      "maxItems": 2
     }
   },
   "required": [],

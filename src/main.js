@@ -184,10 +184,6 @@ async function main() {
             requestHandlerTimeoutSecs: 60,
             navigationTimeoutSecs: 30,
             maxRequestsPerMinute,
-            requestOptions: {
-                // Force HTTP/1.1 because TotalJobs intermittently closes HTTP/2 streams
-                http2: false,
-            },
             
             // Pre-navigation hook for stealth headers
             preNavigationHooks: [
@@ -209,6 +205,9 @@ async function main() {
                         'Cache-Control': 'no-cache',
                         'Pragma': 'no-cache',
                     });
+
+                    // Force HTTP/1.1 because TotalJobs intermittently closes HTTP/2 streams
+                    gotoOptions.http2 = false;
                     
                     // Small network delay
                     await randomDelay(navDelay.min, navDelay.max);
