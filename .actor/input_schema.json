@@ -23,13 +23,6 @@
       "description": "Location to filter results (leave empty for broad results).",
       "editor": "textfield"
     },
-    "collectDetails": {
-      "title": "Collect job details",
-      "type": "boolean",
-      "description": "If enabled, scraper opens job detail pages for full description.",
-      "editor": "checkbox",
-      "default": true
-    },
     "postedWithin": {
       "title": "Posted within (days)",
       "type": "string",
@@ -37,6 +30,13 @@
       "editor": "select",
       "enum": ["1", "3", "7"],
       "enumTitles": ["Last 24 hours", "Last 3 days", "Last 7 days"]
+    },
+        "collectDetails": {
+      "title": "Collect job details",
+      "type": "boolean",
+      "description": "If enabled, scraper opens job detail pages for full description.",
+      "editor": "checkbox",
+      "default": true
     },
     "results_wanted": {
       "title": "Maximum number of jobs",
