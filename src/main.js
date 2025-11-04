@@ -76,6 +76,11 @@ function randomDelay(min, max) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Utility: exponential backoff for retries
+function getBackoffDelay(retryCount) {
+  return Math.min(1000 * Math.pow(2, retryCount) + Math.random() * 1000, 10000);
+}
+
 // Single-entrypoint main
 await Actor.init();
 
@@ -123,41 +128,38 @@ async function main() {
         let saved = 0;
         let pagesVisited = 0;
         const seenUrls = new Set();
+        const failedUrls = new Set();
 
         await Dataset.open('totaljobs-jobs');
 
-        // Stealth best practices: aggressive session rotation, lower concurrency, human-like delays
+        // Stealth best practices: balanced speed and stealth
         const crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 5,
+            maxRequestRetries: 3,
             useSessionPool: true,
             sessionPoolOptions: {
-                maxPoolSize: 50,
+                maxPoolSize: 20,
                 sessionOptions: {
-                    maxUsageCount: 3, // aggressive rotation
-                    maxErrorScore: 1,
+                    maxUsageCount: 10,
+                    maxErrorScore: 3,
                 },
             },
-            maxConcurrency: 2, // lower concurrency for stealth
-            minConcurrency: 1,
-            requestHandlerTimeoutSecs: 120,
-            navigationTimeoutSecs: 60,
+            maxConcurrency: 5,
+            minConcurrency: 2,
+            requestHandlerTimeoutSecs: 60,
+            navigationTimeoutSecs: 30,
+            maxRequestsPerMinute: 120,
             
             // Pre-navigation hook for stealth headers
             preNavigationHooks: [
-                async ({ request, session }, gotoOptions) => {
-                    // Realistic referer chain
-                    const referers = [
-                        'https://www.google.com/',
-                        'https://www.google.co.uk/search?q=admin+jobs+uk',
-                        'https://www.totaljobs.com/',
-                    ];
-                    const referer = request.userData?.referer || referers[Math.floor(Math.random() * referers.length)];
+                async ({ request }, gotoOptions) => {
+                    // Realistic referer
+                    const referer = request.userData?.referer || 'https://www.totaljobs.com/';
                     
                     if (!gotoOptions.headers) gotoOptions.headers = {};
                     Object.assign(gotoOptions.headers, {
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                        'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'en-GB,en;q=0.9',
                         'Accept-Encoding': 'gzip, deflate, br',
                         'Referer': referer,
                         'Sec-Fetch-Dest': 'document',
@@ -165,19 +167,18 @@ async function main() {
                         'Sec-Fetch-Site': referer.includes('totaljobs') ? 'same-origin' : 'cross-site',
                         'Sec-Fetch-User': '?1',
                         'Upgrade-Insecure-Requests': '1',
-                        'Cache-Control': 'max-age=0',
+                        'Cache-Control': 'no-cache',
+                        'Pragma': 'no-cache',
                     });
                     
-                    // Human-like delay before request (network latency simulation)
-                    await randomDelay(200, 800);
+                    // Small network delay
+                    await randomDelay(50, 200);
                 },
             ],
 
             async requestHandler({ request, $, enqueueLinks, session, log: crawlerLog }) {
                 const isDetailPage = /\/job\/[^/]+\/[^/]+-job\d+/.test(request.url);
                 const isListPage = /\/jobs\//.test(request.url) && !isDetailPage;
-
-                crawlerLog.info(`Processing ${isDetailPage ? 'DETAIL' : 'LIST'} page: ${request.url}`);
 
                 // LIST PAGE: extract job links and pagination
                 if (isListPage) {
@@ -187,8 +188,8 @@ async function main() {
                         return;
                     }
 
-                    // Human-like reading time delay
-                    await randomDelay(1500, 3500);
+                    // Quick delay
+                    await randomDelay(300, 800);
 
                     // Find all job links: /job/[title]/[company]-job[id]
                     const jobLinks = [];
@@ -196,7 +197,7 @@ async function main() {
                         const href = $(el).attr('href');
                         if (href && href.match(/\/job\/[^/]+\/[^/]+-job\d+/)) {
                             const fullUrl = `https://www.totaljobs.com${href}`;
-                            if (!seenUrls.has(fullUrl)) {
+                            if (!seenUrls.has(fullUrl) && !failedUrls.has(fullUrl)) {
                                 seenUrls.add(fullUrl);
                                 
                                 // Extract basic info from listing (fallback if detail fails)
@@ -212,7 +213,6 @@ async function main() {
                                     'a[href*="/jobs/"]',
                                     '.company',
                                     'span:contains("Ltd")',
-                                    'div:nth-child(2)',
                                 ]) || null;
                                 
                                 const location = pickText($container, [
@@ -241,21 +241,24 @@ async function main() {
                         }
                     });
 
-                    crawlerLog.info(`Found ${jobLinks.length} unique job links on listing page`);
+                    crawlerLog.info(`Found ${jobLinks.length} unique job links on page ${pagesVisited}`);
 
                     // Enqueue job detail pages
                     if (collectDetails && jobLinks.length > 0) {
                         const toEnqueue = jobLinks.slice(0, RESULTS_WANTED - saved);
-                        await enqueueLinks({
-                            urls: toEnqueue.map(j => j.url),
-                            transformRequestFunction: (req) => {
-                                const match = jobLinks.find(j => j.url === req.url);
-                                if (match) {
-                                    req.userData = match.userData;
-                                }
-                                return req;
-                            },
-                        });
+                        if (toEnqueue.length > 0) {
+                            await enqueueLinks({
+                                urls: toEnqueue.map(j => j.url),
+                                transformRequestFunction: (req) => {
+                                    const match = jobLinks.find(j => j.url === req.url);
+                                    if (match) {
+                                        req.userData = match.userData;
+                                    }
+                                    return req;
+                                },
+                            });
+                            crawlerLog.info(`Enqueued ${toEnqueue.length} job detail pages`);
+                        }
                     } else if (!collectDetails && jobLinks.length > 0) {
                         // Save minimal data from listing
                         const toPush = jobLinks.slice(0, RESULTS_WANTED - saved).map(j => ({
@@ -283,14 +286,16 @@ async function main() {
                         $('a[href*="?page="]').each((i, el) => {
                             const href = $(el).attr('href');
                             if (href && href.match(/page=\d+/)) {
-                                nextPageLinks.push(`https://www.totaljobs.com${href.startsWith('/') ? href : '/' + href}`);
+                                const fullHref = href.startsWith('http') ? href : `https://www.totaljobs.com${href.startsWith('/') ? href : '/' + href}`;
+                                nextPageLinks.push(fullHref);
                             }
                         });
                         
                         // Try "Next" button
                         const nextLink = $('a:contains("Next")').first().attr('href');
                         if (nextLink) {
-                            nextPageLinks.push(`https://www.totaljobs.com${nextLink.startsWith('/') ? nextLink : '/' + nextLink}`);
+                            const fullNext = nextLink.startsWith('http') ? nextLink : `https://www.totaljobs.com${nextLink.startsWith('/') ? nextLink : '/' + nextLink}`;
+                            nextPageLinks.push(fullNext);
                         }
 
                         if (nextPageLinks.length > 0) {
@@ -313,12 +318,12 @@ async function main() {
                 // DETAIL PAGE: extract full job details
                 if (isDetailPage) {
                     if (saved >= RESULTS_WANTED) {
-                        crawlerLog.info('Reached results limit, skipping detail page');
+                        crawlerLog.debug('Reached results limit, skipping detail page');
                         return;
                     }
 
-                    // Human-like reading time for job detail
-                    await randomDelay(2000, 5000);
+                    // Quick delay
+                    await randomDelay(400, 1000);
 
                     const seed = request.userData?.seed || {};
 
@@ -396,21 +401,26 @@ async function main() {
                     if (record.title && record.job_url) {
                         await Dataset.pushData(record);
                         saved++;
-                        crawlerLog.info(`Saved job #${saved}: ${record.title} at ${record.company || 'Unknown'}`);
+                        crawlerLog.info(`✓ Saved job #${saved}: ${record.title}`);
                     } else {
                         crawlerLog.warning(`Skipped incomplete job: ${request.url}`);
                     }
                 }
             },
 
-            // Error handling with exponential backoff
+            // Error handling with smart retry
             failedRequestHandler: async ({ request }, error) => {
-                log.error(`Request ${request.url} failed after ${request.retryCount} retries: ${error.message}`);
+                failedUrls.add(request.url);
+                const is403or429 = error.message.includes('403') || error.message.includes('429');
+                const isNetworkError = error.message.includes('NGHTTP2') || error.message.includes('socket') || error.message.includes('ECONNRESET');
                 
-                // Check for blocking signals
-                if (error.message.includes('403') || error.message.includes('429')) {
-                    log.warning(`Possible blocking detected on ${request.url}. Rotating session/proxy.`);
-                    await randomDelay(3000, 8000); // exponential backoff with jitter
+                if (is403or429) {
+                    log.warning(`Blocked on ${request.url} - rotating session`);
+                    await randomDelay(2000, 4000);
+                } else if (isNetworkError) {
+                    log.debug(`Network error on ${request.url}: ${error.message}`);
+                } else {
+                    log.error(`Failed ${request.url} after ${request.retryCount} retries: ${error.message}`);
                 }
             },
         });
