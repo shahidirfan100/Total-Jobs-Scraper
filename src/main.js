@@ -172,7 +172,6 @@ async function main() {
             proxyConfiguration: proxyConf,
             maxRequestRetries: 3,
             useSessionPool: true,
-            useHttp2: false,
             sessionPoolOptions: {
                 maxPoolSize: sessionPoolSize,
                 sessionOptions: {
