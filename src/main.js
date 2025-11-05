@@ -282,36 +282,26 @@ async function main() {
 
                     // Pagination: follow next page link
                     if (saved < RESULTS_WANTED && pagesVisited < MAX_PAGES) {
-                        const nextPageLinks = [];
-                        
-                        // Try numbered pagination links
-                        $('a[href*="?page="]').each((i, el) => {
-                            const href = $(el).attr('href');
-                            if (href && href.match(/page=\d+/)) {
-                                const fullHref = href.startsWith('http') ? href : `https://www.totaljobs.com${href.startsWith('/') ? href : '/' + href}`;
-                                nextPageLinks.push(fullHref);
-                            }
-                        });
-                        
-                        // Try "Next" button
-                        const nextLink = $('a:contains("Next")').first().attr('href');
-                        if (nextLink) {
-                            const fullNext = nextLink.startsWith('http') ? nextLink : `https://www.totaljobs.com${nextLink.startsWith('/') ? nextLink : '/' + nextLink}`;
-                            nextPageLinks.push(fullNext);
-                        }
+                        const currentUrlObj = new URL(request.url);
+                        const currentPage = currentUrlObj.searchParams.has('page')
+                            ? Number(currentUrlObj.searchParams.get('page'))
+                            : 1;
+                        const nextPageNum = currentPage + 1;
 
-                        if (nextPageLinks.length > 0) {
-                            const nextPage = nextPageLinks[0];
-                            if (!seenUrls.has(nextPage)) {
-                                seenUrls.add(nextPage);
+                        if (nextPageNum <= MAX_PAGES) {
+                            currentUrlObj.searchParams.set('page', String(nextPageNum));
+                            const nextPageUrl = currentUrlObj.href;
+
+                            if (!seenUrls.has(nextPageUrl)) {
+                                seenUrls.add(nextPageUrl);
                                 await enqueueLinks({
-                                    urls: [nextPage],
+                                    urls: [nextPageUrl],
                                     transformRequestFunction: (req) => {
                                         req.userData = { referer: request.url };
                                         return req;
                                     },
                                 });
-                                crawlerLog.info(`Enqueued next page: ${nextPage}`);
+                                crawlerLog.info(`Enqueued next page: ${nextPageUrl}`);
                             }
                         }
                     }
