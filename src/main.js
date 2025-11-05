@@ -4,8 +4,18 @@ import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 
 const REFERER_FALLBACK = 'https://www.google.com/';
-const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36';
-const DEFAULT_SEC_CH_UA = '"Chromium";v="118", "Google Chrome";v="118", "Not;A=Brand";v="99"';
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.95 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.95 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6167.85 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.224 Safari/537.36',
+];
+const DEFAULT_USER_AGENT = USER_AGENTS[0];
+const DEFAULT_SEC_CH_UA = '"Chromium";v="122", "Google Chrome";v="122", "Not;A=Brand";v="99"';
+
+function getRandomUserAgent() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
 
 // Selector documentation based on actualTotalJobs.com structure (Nov 2025)
 // LISTING PAGE: Job links found as: <a href="/job/[title]/[company]-job[id]">
@@ -186,12 +196,13 @@ async function main() {
 
         const requestQueue = await Actor.openRequestQueue();
         for (const start of initial) {
+            const userAgent = getRandomUserAgent();
             await requestQueue.addRequest({
                 url: start,
                 uniqueKey: `start:${start}`,
                 userData: {
                     referer: REFERER_FALLBACK,
-                    userAgent: DEFAULT_USER_AGENT,
+                    userAgent,
                     requeueAttempt: 0,
                 },
             });
@@ -234,20 +245,38 @@ async function main() {
             
             // Pre-navigation hook for stealth headers
             preNavigationHooks: [
-                async ({ request }, gotoOptions) => {
-                    // Realistic referer
-                    const referer = request.userData?.referer || REFERER_FALLBACK;
-                    const userAgent = request.userData?.userAgent || DEFAULT_USER_AGENT;
-                    
+                async ({ request, session }, gotoOptions) => {
+                    // Realistic referer and user agent
+                    const referer = request.userData?.referer || session?.userData?.referer || REFERER_FALLBACK;
+                    const activeUserAgent = request.userData?.userAgent
+                        || session?.userData?.userAgent
+                        || getRandomUserAgent();
+
+                    request.userData = {
+                        ...request.userData,
+                        referer,
+                        userAgent: activeUserAgent,
+                    };
+
+                    if (session) {
+                        session.userData ??= {};
+                        session.userData.userAgent = activeUserAgent;
+                        session.userData.referer = referer;
+                    }
+
                     if (!gotoOptions.headers) gotoOptions.headers = {};
+                    const host = new URL(request.url).host;
                     Object.assign(gotoOptions.headers, {
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
                         'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
                         'Accept-Encoding': 'gzip, deflate, br',
+                        'Cache-Control': 'no-cache',
+                        'Pragma': 'no-cache',
                         'DNT': '1',
+                        'Host': host,
                         'Connection': 'keep-alive',
                         'Referer': referer,
-                        'User-Agent': userAgent,
+                        'User-Agent': activeUserAgent,
                         'Sec-CH-UA': DEFAULT_SEC_CH_UA,
                         'Sec-CH-UA-Mobile': '?0',
                         'Sec-CH-UA-Platform': '"Windows"',
@@ -546,6 +575,31 @@ async function main() {
                 const isHttp2Error = /NGHTTP2/i.test(message);
                 const isNetworkError = isHttp2Error || isSocketError || /ENOTFOUND|EAI_AGAIN/i.test(message);
 
+                const scheduleNextPageFallback = async () => {
+                    try {
+                        const currentUrl = new URL(url);
+                        const currentPage = parseInt(currentUrl.searchParams.get('page') || '1', 10);
+                        if (!Number.isFinite(currentPage) || currentPage >= MAX_PAGES) return;
+                        const nextPageNum = currentPage + 1;
+                        currentUrl.searchParams.set('page', nextPageNum.toString());
+                        const nextPageUrl = currentUrl.href;
+                        if (seenUrls.has(nextPageUrl) || failedUrls.has(nextPageUrl)) return;
+                        seenUrls.add(nextPageUrl);
+                        await requestQueue.addRequest({
+                            url: nextPageUrl,
+                            uniqueKey: `${nextPageUrl}#fallback-${Date.now()}`,
+                            userData: {
+                                referer: REFERER_FALLBACK,
+                                userAgent: getRandomUserAgent(),
+                                requeueAttempt: 0,
+                            },
+                        });
+                        log.warning(`Scheduled fallback to page ${nextPageNum} after repeated failures on ${url}`);
+                    } catch (err) {
+                        log.debug(`Failed to enqueue fallback page after ${url}: ${err.message}`);
+                    }
+                };
+
                 if (isDetailPage && collectDetails && request.userData?.seed && !failedUrls.has(url)) {
                     const seed = request.userData.seed;
                     const fallbackRecord = {
@@ -568,20 +622,28 @@ async function main() {
 
                 if (isListPage) {
                     const requeueAttempt = Number(request.userData?.requeueAttempt || 0);
+                    const nextAttempt = requeueAttempt + 1;
                     if (requeueAttempt < 2 && saved < RESULTS_WANTED) {
+                        const nextUserAgent = nextAttempt > 1
+                            ? getRandomUserAgent()
+                            : (request.userData?.userAgent || getRandomUserAgent());
+                        const nextReferer = nextAttempt > 1
+                            ? REFERER_FALLBACK
+                            : (request.userData?.referer || REFERER_FALLBACK);
                         await requestQueue.addRequest({
                             url,
                             uniqueKey: `${url}#retry-${Date.now()}`,
                             userData: {
                                 ...request.userData,
-                                referer: request.userData?.referer || REFERER_FALLBACK,
-                                userAgent: request.userData?.userAgent || DEFAULT_USER_AGENT,
-                                requeueAttempt: requeueAttempt + 1,
+                                referer: nextReferer,
+                                userAgent: nextUserAgent,
+                                requeueAttempt: nextAttempt,
                             },
                         });
-                        log.warning(`Requeued listing page after failure (attempt ${requeueAttempt + 1}): ${url}`);
+                        log.warning(`Requeued listing page after failure (attempt ${nextAttempt}): ${url}`);
                     } else {
                         failedUrls.add(url);
+                        await scheduleNextPageFallback();
                     }
                 } else if (!isNetworkError && !isTimeout && !is403or429) {
                     failedUrls.add(url);
@@ -594,11 +656,11 @@ async function main() {
                 } else if (isSocketError) {
                     log.warning(`Socket error on ${url} (attempt ${attempt}) - will retry`);
                     session?.markBad();
-                    await randomDelay(800, 1500);
+                    await randomDelay(1500, 2500);
                 } else if (isTimeout) {
                     log.warning(`Timeout on ${url} (attempt ${attempt}) - will retry`);
                     session?.markBad();
-                    await randomDelay(500, 1200);
+                    await randomDelay(1200, 2000);
                 } else if (isHttp2Error) {
                     log.debug(`HTTP/2 transport error on ${url}, retrying with new session.`);
                     session?.retire();
@@ -606,7 +668,7 @@ async function main() {
                 } else if (isNetworkError) {
                     log.debug(`Network error on ${url}: ${message}`);
                     session?.markBad();
-                    await randomDelay(400, 900);
+                    await randomDelay(800, 1600);
                 } else {
                     log.error(`Failed ${url} after ${attempt} retries: ${message}`);
                     failedUrls.add(url);
