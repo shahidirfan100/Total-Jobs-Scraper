@@ -286,23 +286,54 @@ async function main() {
                         const currentPage = currentUrlObj.searchParams.has('page')
                             ? Number(currentUrlObj.searchParams.get('page'))
                             : 1;
-                        const nextPageNum = currentPage + 1;
 
-                        if (nextPageNum <= MAX_PAGES) {
-                            currentUrlObj.searchParams.set('page', String(nextPageNum));
-                            const nextPageUrl = currentUrlObj.href;
+                        const candidateUrls = [];
 
-                            if (!seenUrls.has(nextPageUrl)) {
-                                seenUrls.add(nextPageUrl);
-                                await enqueueLinks({
-                                    urls: [nextPageUrl],
-                                    transformRequestFunction: (req) => {
-                                        req.userData = { referer: request.url };
-                                        return req;
-                                    },
-                                });
-                                crawlerLog.info(`Enqueued next page: ${nextPageUrl}`);
-                            }
+                        // Gather numbered pagination links
+                        $('a[href*="?page="]').each((i, el) => {
+                            const href = $(el).attr('href');
+                            if (!href || !href.match(/page=\d+/)) return;
+                            const fullHref = href.startsWith('http')
+                                ? href
+                                : `https://www.totaljobs.com${href.startsWith('/') ? href : '/' + href}`;
+                            candidateUrls.push(fullHref);
+                        });
+
+                        // Fallback to "Next" button if present
+                        const nextLink = $('a:contains("Next")').first().attr('href');
+                        if (nextLink) {
+                            const fullNext = nextLink.startsWith('http')
+                                ? nextLink
+                                : `https://www.totaljobs.com${nextLink.startsWith('/') ? nextLink : '/' + nextLink}`;
+                            candidateUrls.push(fullNext);
+                        }
+
+                        const nextPageUrl = candidateUrls
+                            .map((href) => {
+                                try {
+                                    return new URL(href);
+                                } catch {
+                                    return null;
+                                }
+                            })
+                            .filter((urlObj) => {
+                                if (!urlObj) return false;
+                                const pageVal = Number(urlObj.searchParams.get('page'));
+                                return Number.isFinite(pageVal) && pageVal > currentPage && pageVal <= MAX_PAGES;
+                            })
+                            .sort((a, b) => Number(a.searchParams.get('page')) - Number(b.searchParams.get('page')))
+                            .map((urlObj) => urlObj.href)[0];
+
+                        if (nextPageUrl && !seenUrls.has(nextPageUrl)) {
+                            seenUrls.add(nextPageUrl);
+                            await enqueueLinks({
+                                urls: [nextPageUrl],
+                                transformRequestFunction: (req) => {
+                                    req.userData = { referer: request.url };
+                                    return req;
+                                },
+                            });
+                            crawlerLog.info(`Enqueued next page: ${nextPageUrl}`);
                         }
                     }
                 }
