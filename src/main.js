@@ -251,7 +251,11 @@ async function main() {
 
                     // Force HTTP/1.1 because TotalJobs intermittently closes HTTP/2 streams
                     gotoOptions.http2 = false;
-                    gotoOptions.timeout = Math.max(gotoOptions.timeout ?? 0, 60000);
+                    if (!gotoOptions.timeout || typeof gotoOptions.timeout !== 'object') {
+                        gotoOptions.timeout = { request: 60000 };
+                    } else {
+                        gotoOptions.timeout.request = Math.max(gotoOptions.timeout.request ?? 0, 60000);
+                    }
                     
                     // Small network delay
                     await randomDelay(navDelay.min, navDelay.max);
