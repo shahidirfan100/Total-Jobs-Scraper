@@ -122,27 +122,28 @@ async function main() {
         const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : 100;
         const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 10;
 
-        const maxRequestsPerMinute = Number.isFinite(+inputMaxRpm) ? Math.max(90, +inputMaxRpm) : 220;
-        const maxConcurrency = Number.isFinite(+inputMaxConcurrency) ? Math.max(4, Math.min(24, +inputMaxConcurrency)) : 12;
+        const maxRequestsPerMinute = Number.isFinite(+inputMaxRpm) ? Math.max(90, +inputMaxRpm) : 300;
+        const maxConcurrency = Number.isFinite(+inputMaxConcurrency) ? Math.max(4, Math.min(24, +inputMaxConcurrency)) : 18;
         const minConcurrency = Number.isFinite(+inputMinConcurrency)
             ? Math.max(2, Math.min(+inputMinConcurrency, maxConcurrency))
-            : Math.max(3, Math.min(10, Math.floor(maxConcurrency / 2)));
+            : Math.max(8, Math.min(12, Math.floor(maxConcurrency * 0.6)));
 
-        const navDelay = normalizeDelayRange(navigationDelayRange, { min: 30, max: 120 });
-        const listDelay = normalizeDelayRange(listingDelayRange, { min: 120, max: 280 });
-        const detailDelay = normalizeDelayRange(detailDelayRange, { min: 220, max: 520 });
-        const blockDelay = normalizeDelayRange(blockDelayRange, { min: 1200, max: 2000 });
+        const navDelay = normalizeDelayRange(navigationDelayRange, { min: 10, max: 50 });
+        const listDelay = normalizeDelayRange(listingDelayRange, { min: 50, max: 150 });
+        const detailDelay = normalizeDelayRange(detailDelayRange, { min: 100, max: 250 });
+        const blockDelay = normalizeDelayRange(blockDelayRange, { min: 800, max: 1500 });
 
         const sessionPoolSize = Math.max(30, maxConcurrency * 3);
 
         // Build start URL from keyword/location or use provided URL
         const buildStartUrl = (kw, loc, cat, posted) => {
             const base = 'https://www.totaljobs.com/jobs';
-            if (!kw && !loc && !cat) return `${base}/admin`;
+            if (!kw && !loc && !cat) return `${base}/admin?page=1`;
             const u = new URL(base + (kw ? `/${encodeURIComponent(kw)}` : ''));
             if (loc) u.searchParams.set('Location', loc);
             if (cat) u.searchParams.set('Category', cat);
             if (posted && ['1', '3', '7'].includes(posted)) u.searchParams.set('postedWithin', posted);
+            u.searchParams.set('page', '1');
             return u.href;
         };
 
@@ -170,40 +171,40 @@ async function main() {
         // Stealth best practices: balanced speed and stealth
         const crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 3,
+            maxRequestRetries: 4,
             useSessionPool: true,
             sessionPoolOptions: {
                 maxPoolSize: sessionPoolSize,
                 sessionOptions: {
-                    maxUsageCount: 15,
-                    maxErrorScore: 3,
+                    maxUsageCount: 25,
+                    maxErrorScore: 4,
                 },
             },
             maxConcurrency,
             minConcurrency,
-            requestHandlerTimeoutSecs: 60,
-            navigationTimeoutSecs: 30,
+            requestHandlerTimeoutSecs: 90,
+            navigationTimeoutSecs: 60,
             maxRequestsPerMinute,
             
             // Pre-navigation hook for stealth headers
             preNavigationHooks: [
                 async ({ request }, gotoOptions) => {
                     // Realistic referer
-                    const referer = request.userData?.referer || 'https://www.totaljobs.com/';
+                    const referer = request.userData?.referer || 'https://www.google.com/';
                     
                     if (!gotoOptions.headers) gotoOptions.headers = {};
                     Object.assign(gotoOptions.headers, {
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                        'Accept-Language': 'en-GB,en;q=0.9',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                        'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
                         'Accept-Encoding': 'gzip, deflate, br',
+                        'DNT': '1',
+                        'Connection': 'keep-alive',
                         'Referer': referer,
                         'Sec-Fetch-Dest': 'document',
                         'Sec-Fetch-Mode': 'navigate',
                         'Sec-Fetch-Site': referer.includes('totaljobs') ? 'same-origin' : 'cross-site',
                         'Sec-Fetch-User': '?1',
                         'Upgrade-Insecure-Requests': '1',
-                        'Cache-Control': 'no-cache',
-                        'Pragma': 'no-cache',
                     });
 
                     // Force HTTP/1.1 because TotalJobs intermittently closes HTTP/2 streams
@@ -225,9 +226,6 @@ async function main() {
                         crawlerLog.info(`Reached max pages limit (${MAX_PAGES})`);
                         return;
                     }
-
-                    // Quick delay
-                    await randomDelay(listDelay.min, listDelay.max);
 
                     // Find all job links: /job/[title]/[company]-job[id]
                     const jobLinks = [];
@@ -318,37 +316,25 @@ async function main() {
 
                     // Pagination: follow next page link
                     if (saved < RESULTS_WANTED && pagesVisited < MAX_PAGES) {
-                        const nextPageLinks = [];
+                        // Extract current page number from URL
+                        const currentUrl = new URL(request.url);
+                        const currentPage = parseInt(currentUrl.searchParams.get('page') || '1', 10);
+                        const nextPageNum = currentPage + 1;
                         
-                        // Try numbered pagination links
-                        $('a[href*="?page="]').each((i, el) => {
-                            const href = $(el).attr('href');
-                            if (href && href.match(/page=\d+/)) {
-                                const fullHref = href.startsWith('http') ? href : `https://www.totaljobs.com${href.startsWith('/') ? href : '/' + href}`;
-                                nextPageLinks.push(fullHref);
-                            }
-                        });
+                        // Build next page URL by setting page parameter
+                        currentUrl.searchParams.set('page', nextPageNum.toString());
+                        const nextPage = currentUrl.href;
                         
-                        // Try "Next" button
-                        const nextLink = $('a:contains("Next")').first().attr('href');
-                        if (nextLink) {
-                            const fullNext = nextLink.startsWith('http') ? nextLink : `https://www.totaljobs.com${nextLink.startsWith('/') ? nextLink : '/' + nextLink}`;
-                            nextPageLinks.push(fullNext);
-                        }
-
-                        if (nextPageLinks.length > 0) {
-                            const nextPage = nextPageLinks[0];
-                            if (!seenUrls.has(nextPage)) {
-                                seenUrls.add(nextPage);
-                                await enqueueLinks({
-                                    urls: [nextPage],
-                                    transformRequestFunction: (req) => {
-                                        req.userData = { referer: request.url };
-                                        return req;
-                                    },
-                                });
-                                crawlerLog.info(`Enqueued next page: ${nextPage}`);
-                            }
+                        if (!seenUrls.has(nextPage)) {
+                            seenUrls.add(nextPage);
+                            await enqueueLinks({
+                                urls: [nextPage],
+                                transformRequestFunction: (req) => {
+                                    req.userData = { referer: request.url };
+                                    return req;
+                                },
+                            });
+                            crawlerLog.info(`Enqueued next page ${nextPageNum}: ${nextPage}`);
                         }
                     }
                 }
@@ -359,9 +345,6 @@ async function main() {
                         crawlerLog.debug('Reached results limit, skipping detail page');
                         return;
                     }
-
-                    // Quick delay
-                    await randomDelay(detailDelay.min, detailDelay.max);
 
                     const seed = request.userData?.seed || {};
 
@@ -450,22 +433,29 @@ async function main() {
             failedRequestHandler: async ({ request, session }, error) => {
                 failedUrls.add(request.url);
                 const message = error?.message || '';
-                const is403or429 = message.includes('403') || message.includes('429');
+                const statusCode = error?.statusCode || 0;
+                const is403or429 = statusCode === 403 || statusCode === 429 || message.includes('403') || message.includes('429');
+                const isTimeout = message.includes('timed out') || message.includes('timeout');
                 const isHttp2Error = message.includes('NGHTTP2');
-                const isNetworkError = isHttp2Error || message.includes('socket') || message.includes('ECONNRESET');
+                const isNetworkError = isHttp2Error || message.includes('socket') || message.includes('ECONNRESET') || message.includes('ETIMEDOUT');
                 
                 if (is403or429) {
-                    log.warning(`Blocked on ${request.url} - rotating session`);
-                    await randomDelay(blockDelay.min, blockDelay.max);
+                    log.warning(`Blocked (403/429) on ${request.url} - rotating session after delay`);
                     session?.retire();
+                    await randomDelay(blockDelay.min, blockDelay.max);
+                } else if (isTimeout) {
+                    log.warning(`Timeout on ${request.url} (attempt ${request.retryCount + 1}) - will retry`);
+                    session?.markBad();
+                    await randomDelay(500, 1000);
                 } else if (isHttp2Error) {
                     log.debug(`HTTP/2 transport error on ${request.url}, retrying with new session.`);
                     session?.retire();
-                    await randomDelay(blockDelay.min / 2, blockDelay.max / 2);
+                    await randomDelay(300, 800);
                 } else if (isNetworkError) {
                     log.debug(`Network error on ${request.url}: ${error.message}`);
+                    session?.markBad();
                 } else {
-                    log.error(`Failed ${request.url} after ${request.retryCount} retries: ${error.message}`);
+                    log.error(`Failed ${request.url} after ${request.retryCount + 1} retries: ${error.message}`);
                 }
             },
         });
