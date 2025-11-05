@@ -3,6 +3,10 @@ import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 
+const REFERER_FALLBACK = 'https://www.google.com/';
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36';
+const DEFAULT_SEC_CH_UA = '"Chromium";v="118", "Google Chrome";v="118", "Not;A=Brand";v="99"';
+
 // Selector documentation based on actualTotalJobs.com structure (Nov 2025)
 // LISTING PAGE: Job links found as: <a href="/job/[title]/[company]-job[id]">
 // Pattern: Links start with /job/ and contain job title, company slug, and job ID
@@ -122,10 +126,14 @@ async function main() {
         const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : 100;
         const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 10;
 
-        const maxRequestsPerMinute = Number.isFinite(+inputMaxRpm) ? Math.max(90, +inputMaxRpm) : 180;
-        const maxConcurrency = Number.isFinite(+inputMaxConcurrency) ? Math.max(4, Math.min(24, +inputMaxConcurrency)) : 10;
+        const maxRequestsPerMinute = Number.isFinite(+inputMaxRpm)
+            ? Math.min(160, Math.max(50, +inputMaxRpm))
+            : 110;
+        const maxConcurrency = Number.isFinite(+inputMaxConcurrency)
+            ? Math.max(4, Math.min(16, +inputMaxConcurrency))
+            : 8;
         const minConcurrency = Number.isFinite(+inputMinConcurrency)
-            ? Math.max(2, Math.min(+inputMinConcurrency, maxConcurrency))
+            ? Math.max(2, Math.min(maxConcurrency, +inputMinConcurrency))
             : Math.max(4, Math.min(6, Math.floor(maxConcurrency * 0.6)));
 
         const navDelay = normalizeDelayRange(navigationDelayRange, { min: 50, max: 200 });
@@ -162,20 +170,37 @@ async function main() {
             : undefined;
         
         if (proxyConf) {
-            log.info('✓ Proxy configuration enabled for anti-blocking');
+            log.info('Proxy configuration enabled for anti-blocking');
         } else {
-            log.warning('⚠ Running without proxies - may face rate limiting. Consider enabling Apify proxies for better results.');
+            log.warning('Running without proxies - may face rate limiting. Consider enabling Apify proxies for better results.');
         }
 
         let saved = 0;
         let pagesVisited = 0;
         const seenUrls = new Set();
         const failedUrls = new Set();
+        const savedJobUrls = new Set();
 
         await Dataset.open('totaljobs-jobs');
 
+        const requestQueue = await Actor.openRequestQueue();
+
+        const saveJobRecord = async (record, logger, label) => {
+            if (!record?.job_url || !record?.title) return false;
+            if (saved >= RESULTS_WANTED) return false;
+            if (savedJobUrls.has(record.job_url)) return false;
+            await Dataset.pushData(record);
+            savedJobUrls.add(record.job_url);
+            saved++;
+            if (logger && label) {
+                logger.info(`${label} ${record.title} (total: ${saved})`);
+            }
+            return true;
+        };
+
         // Stealth best practices: balanced speed and stealth
         const crawler = new CheerioCrawler({
+            requestQueue,
             proxyConfiguration: proxyConf,
             maxRequestRetries: 4,
             useSessionPool: true,
@@ -199,16 +224,24 @@ async function main() {
             preNavigationHooks: [
                 async ({ request }, gotoOptions) => {
                     // Realistic referer
-                    const referer = request.userData?.referer || 'https://www.google.com/';
+                    const referer = request.userData?.referer || REFERER_FALLBACK;
+                    const userAgent = request.userData?.userAgent || DEFAULT_USER_AGENT;
+                    const host = new URL(request.url).host;
                     
                     if (!gotoOptions.headers) gotoOptions.headers = {};
                     Object.assign(gotoOptions.headers, {
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
                         'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
                         'Accept-Encoding': 'gzip, deflate, br',
+                        'Cache-Control': 'no-cache',
                         'DNT': '1',
+                        'Host': host,
                         'Connection': 'keep-alive',
                         'Referer': referer,
+                        'User-Agent': userAgent,
+                        'Sec-CH-UA': DEFAULT_SEC_CH_UA,
+                        'Sec-CH-UA-Mobile': '?0',
+                        'Sec-CH-UA-Platform': '"Windows"',
                         'Sec-Fetch-Dest': 'document',
                         'Sec-Fetch-Mode': 'navigate',
                         'Sec-Fetch-Site': referer.includes('totaljobs') ? 'same-origin' : 'cross-site',
@@ -218,6 +251,7 @@ async function main() {
 
                     // Force HTTP/1.1 because TotalJobs intermittently closes HTTP/2 streams
                     gotoOptions.http2 = false;
+                    gotoOptions.timeout = Math.max(gotoOptions.timeout ?? 0, 60000);
                     
                     // Small network delay
                     await randomDelay(navDelay.min, navDelay.max);
@@ -296,41 +330,42 @@ async function main() {
 
                     // Enqueue job detail pages
                     if (collectDetails && jobLinks.length > 0) {
-                        // Calculate how many more jobs we need
-                        const needed = RESULTS_WANTED - saved;
-                        // Enqueue extra to account for failures (1.5x buffer)
-                        const toEnqueue = jobLinks.slice(0, Math.ceil(needed * 1.5));
+                        const needed = Math.max(0, RESULTS_WANTED - saved);
+                        const bufferSize = Math.max(1, Math.ceil(needed * 1.5));
+                        const toEnqueue = jobLinks.slice(0, Math.min(bufferSize, jobLinks.length));
                         if (toEnqueue.length > 0) {
                             await enqueueLinks({
-                                urls: toEnqueue.map(j => j.url),
-                                transformRequestFunction: (req) => {
-                                    const match = jobLinks.find(j => j.url === req.url);
-                                    if (match) {
-                                        req.userData = match.userData;
-                                    }
-                                    return req;
-                                },
+                                requests: toEnqueue.map((job) => ({
+                                    url: job.url,
+                                    userData: {
+                                        ...job.userData,
+                                        referer: request.url,
+                                        requeueAttempt: job.userData?.requeueAttempt ?? 0,
+                                    },
+                                })),
                             });
-                            crawlerLog.info(`Enqueued ${toEnqueue.length} job detail pages (need ${needed} more jobs)`);
+                            crawlerLog.info(`Enqueued ${toEnqueue.length} job detail pages (need ${Math.max(1, needed)} more jobs)`);
                         }
                     } else if (!collectDetails && jobLinks.length > 0) {
-                        // Save minimal data from listing
-                        const toPush = jobLinks.slice(0, RESULTS_WANTED - saved).map(j => ({
-                            title: j.userData.seed.title,
-                            company: j.userData.seed.company,
-                            location: j.userData.seed.location,
-                            salary: j.userData.seed.salary,
-                            date_posted: j.userData.seed.date_posted,
-                            job_url: j.url,
-                            job_type: null,
-                            job_category: null,
-                            description_html: null,
-                            description_text: null,
-                        }));
-                        await Dataset.pushData(toPush);
-                        saved += toPush.length;
-                        crawlerLog.info(`Saved ${toPush.length} jobs (total: ${saved})`);
+                        for (const job of jobLinks) {
+                            if (saved >= RESULTS_WANTED) break;
+                            const seed = job.userData.seed || {};
+                            await saveJobRecord({
+                                title: seed.title,
+                                company: seed.company,
+                                location: seed.location,
+                                salary: seed.salary,
+                                date_posted: seed.date_posted,
+                                job_type: null,
+                                job_category: null,
+                                description_html: null,
+                                description_text: null,
+                                job_url: job.url,
+                            }, crawlerLog, 'Saved job from listing:');
+                        }
                     }
+
+                    await randomDelay(listDelay.min, listDelay.max);
 
                     // Pagination: follow next page link
                     if (pagesVisited < MAX_PAGES) {
@@ -365,6 +400,7 @@ async function main() {
                     }
 
                     const seed = request.userData?.seed || {};
+                    await randomDelay(detailDelay.min, detailDelay.max);
                     
                     // Check if we got valid HTML (not blocked/error page)
                     const htmlText = $.html();
@@ -385,9 +421,10 @@ async function main() {
                             description_text: null,
                             job_url: request.loadedUrl || request.url,
                         };
-                        await Dataset.pushData(fallbackRecord);
-                        saved++;
-                        crawlerLog.info(`Saved job #${saved} (from listing data): ${fallbackRecord.title}`);
+                        const savedFallback = await saveJobRecord(fallbackRecord, crawlerLog, 'Saved job from listing data:');
+                        if (savedFallback) {
+                            failedUrls.add(request.url);
+                        }
                         return;
                     }
 
@@ -462,65 +499,104 @@ async function main() {
                     };
 
                     // Validate: must have at least title and URL
-                    if (record.title && record.job_url) {
-                        await Dataset.pushData(record);
-                        saved++;
-                        crawlerLog.info(`Saved job #${saved}: ${record.title}`);
-                    } else {
+                    if (!record.title || !record.job_url) {
                         crawlerLog.warning(`Skipped incomplete job: ${request.url}`);
+                        failedUrls.add(request.url);
+                        return;
+                    }
+
+                    const savedDetail = await saveJobRecord(record, crawlerLog, 'Saved job:');
+                    if (!savedDetail) {
+                        crawlerLog.debug(`Skipped duplicate or limit reached for ${request.url}`);
                     }
                 }
             },
 
             // Error handling with smart retry
             failedRequestHandler: async ({ request, session }, error) => {
+                const url = request.url;
                 const message = error?.message || '';
                 const statusCode = error?.statusCode || 0;
-                const is403or429 = statusCode === 403 || statusCode === 429 || message.includes('403') || message.includes('429') || message.includes('blocked');
-                const isTimeout = message.includes('timed out') || message.includes('timeout');
-                const isSocketError = message.includes('socket hang up') || message.includes('ECONNRESET') || message.includes('ETIMEDOUT');
-                const isHttp2Error = message.includes('NGHTTP2');
-                const isNetworkError = isHttp2Error || isSocketError || message.includes('ENOTFOUND');
-                
-                // Only add to failed set if it's not a recoverable error
-                const isRecoverable = is403or429 || isTimeout || isNetworkError;
-                if (!isRecoverable) {
-                    failedUrls.add(request.url);
+                const attempt = request.retryCount + 1;
+                const isDetailPage = /\/job\/[^/]+\/[^/]+-job\d+/.test(url);
+                const isListPage = /\/jobs\//.test(url) && !isDetailPage;
+
+                const is403or429 = statusCode === 403 || statusCode === 429 || /403|429|blocked/i.test(message);
+                const isTimeout = /timed out|timeout/i.test(message);
+                const isSocketError = /socket hang up|ECONNRESET|ETIMEDOUT/i.test(message);
+                const isHttp2Error = /NGHTTP2/i.test(message);
+                const isNetworkError = isHttp2Error || isSocketError || /ENOTFOUND|EAI_AGAIN/i.test(message);
+
+                if (isDetailPage && collectDetails && request.userData?.seed && !failedUrls.has(url)) {
+                    const seed = request.userData.seed;
+                    const fallbackRecord = {
+                        title: seed.title,
+                        company: seed.company,
+                        location: seed.location,
+                        salary: seed.salary,
+                        date_posted: seed.date_posted,
+                        job_type: null,
+                        job_category: null,
+                        description_html: null,
+                        description_text: null,
+                        job_url: request.loadedUrl || url,
+                    };
+                    const savedFallback = await saveJobRecord(fallbackRecord, log, 'Saved job after failed detail:');
+                    if (savedFallback) {
+                        failedUrls.add(url);
+                    }
                 }
-                
+
+                if (isListPage) {
+                    const requeueAttempt = Number(request.userData?.requeueAttempt || 0);
+                    if (requeueAttempt < 2 && saved < RESULTS_WANTED) {
+                        await requestQueue.addRequest({
+                            url,
+                            uniqueKey: `${url}#retry-${Date.now()}`,
+                            userData: {
+                                ...request.userData,
+                                referer: request.userData?.referer || REFERER_FALLBACK,
+                                requeueAttempt: requeueAttempt + 1,
+                            },
+                        });
+                        log.warning(`Requeued listing page after failure (attempt ${requeueAttempt + 1}): ${url}`);
+                    } else {
+                        failedUrls.add(url);
+                    }
+                } else if (!isNetworkError && !isTimeout && !is403or429) {
+                    failedUrls.add(url);
+                }
+
                 if (is403or429) {
-                    log.warning(`Blocked (403/429) on ${request.url} - rotating session`);
+                    log.warning(`Blocked (403/429) on ${url} - rotating session`);
                     session?.retire();
-                    // Longer delay on blocks
                     await randomDelay(blockDelay.min, blockDelay.max);
                 } else if (isSocketError) {
-                    log.warning(`Socket error on ${request.url} (attempt ${request.retryCount + 1}) - will retry`);
+                    log.warning(`Socket error on ${url} (attempt ${attempt}) - will retry`);
                     session?.markBad();
-                    // Short delay for socket issues
                     await randomDelay(800, 1500);
                 } else if (isTimeout) {
-                    log.warning(`Timeout on ${request.url} (attempt ${request.retryCount + 1}) - will retry`);
+                    log.warning(`Timeout on ${url} (attempt ${attempt}) - will retry`);
                     session?.markBad();
-                    await randomDelay(500, 1000);
+                    await randomDelay(500, 1200);
                 } else if (isHttp2Error) {
-                    log.debug(`HTTP/2 transport error on ${request.url}, retrying with new session.`);
+                    log.debug(`HTTP/2 transport error on ${url}, retrying with new session.`);
                     session?.retire();
                     await randomDelay(300, 800);
                 } else if (isNetworkError) {
-                    log.debug(`Network error on ${request.url}: ${error.message}`);
+                    log.debug(`Network error on ${url}: ${message}`);
                     session?.markBad();
                     await randomDelay(400, 900);
                 } else {
-                    log.error(`Failed ${request.url} after ${request.retryCount + 1} retries: ${error.message}`);
-                    // Don't retry non-network errors
-                    failedUrls.add(request.url);
+                    log.error(`Failed ${url} after ${attempt} retries: ${message}`);
+                    failedUrls.add(url);
                 }
             },
         });
 
         await crawler.run(initial);
 
-        log.info(`✅TotalJobs scraper finished. Saved ${saved} jobs from ${pagesVisited} pages.`);
+        log.info(`TotalJobs scraper finished. Saved ${saved} jobs from ${pagesVisited} pages.`);
     } catch (error) {
         log.error(`Fatal error in main: ${error.message}`, { stack: error.stack });
         throw error;
@@ -534,3 +610,15 @@ main().catch(err => {
     console.error(err);
     process.exit(1);
 });
+
+
+
+
+
+
+
+
+
+
+
+
