@@ -127,19 +127,20 @@ async function main() {
         const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 10;
 
         const maxRequestsPerMinute = Number.isFinite(+inputMaxRpm)
-            ? Math.min(160, Math.max(50, +inputMaxRpm))
-            : 110;
+            ? Math.min(140, Math.max(40, +inputMaxRpm))
+            : 80;
         const maxConcurrency = Number.isFinite(+inputMaxConcurrency)
-            ? Math.max(4, Math.min(16, +inputMaxConcurrency))
-            : 8;
+            ? Math.max(2, Math.min(12, +inputMaxConcurrency))
+            : 5;
+        const derivedMinConcurrency = Math.max(2, Math.floor(maxConcurrency * 0.6));
         const minConcurrency = Number.isFinite(+inputMinConcurrency)
             ? Math.max(2, Math.min(maxConcurrency, +inputMinConcurrency))
-            : Math.max(4, Math.min(6, Math.floor(maxConcurrency * 0.6)));
+            : Math.min(maxConcurrency, derivedMinConcurrency);
 
-        const navDelay = normalizeDelayRange(navigationDelayRange, { min: 50, max: 200 });
-        const listDelay = normalizeDelayRange(listingDelayRange, { min: 50, max: 150 });
-        const detailDelay = normalizeDelayRange(detailDelayRange, { min: 100, max: 250 });
-        const blockDelay = normalizeDelayRange(blockDelayRange, { min: 1500, max: 3000 });
+        const navDelay = normalizeDelayRange(navigationDelayRange, { min: 150, max: 350 });
+        const listDelay = normalizeDelayRange(listingDelayRange, { min: 200, max: 400 });
+        const detailDelay = normalizeDelayRange(detailDelayRange, { min: 250, max: 450 });
+        const blockDelay = normalizeDelayRange(blockDelayRange, { min: 5000, max: 9000 });
 
         const sessionPoolSize = Math.max(30, maxConcurrency * 3);
 
@@ -184,6 +185,17 @@ async function main() {
         await Dataset.open('totaljobs-jobs');
 
         const requestQueue = await Actor.openRequestQueue();
+        for (const start of initial) {
+            await requestQueue.addRequest({
+                url: start,
+                uniqueKey: `start:${start}`,
+                userData: {
+                    referer: REFERER_FALLBACK,
+                    userAgent: DEFAULT_USER_AGENT,
+                    requeueAttempt: 0,
+                },
+            });
+        }
 
         const saveJobRecord = async (record, logger, label) => {
             if (!record?.job_url || !record?.title) return false;
@@ -226,16 +238,13 @@ async function main() {
                     // Realistic referer
                     const referer = request.userData?.referer || REFERER_FALLBACK;
                     const userAgent = request.userData?.userAgent || DEFAULT_USER_AGENT;
-                    const host = new URL(request.url).host;
                     
                     if (!gotoOptions.headers) gotoOptions.headers = {};
                     Object.assign(gotoOptions.headers, {
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
                         'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
                         'Accept-Encoding': 'gzip, deflate, br',
-                        'Cache-Control': 'no-cache',
                         'DNT': '1',
-                        'Host': host,
                         'Connection': 'keep-alive',
                         'Referer': referer,
                         'User-Agent': userAgent,
@@ -324,6 +333,7 @@ async function main() {
                                     userData: {
                                         seed: { title, company, location, salary, date_posted },
                                         referer: request.url,
+                                        userAgent: request.userData?.userAgent || DEFAULT_USER_AGENT,
                                     },
                                 });
                             }
@@ -344,6 +354,7 @@ async function main() {
                                     userData: {
                                         ...job.userData,
                                         referer: request.url,
+                                        userAgent: job.userData?.userAgent || request.userData?.userAgent || DEFAULT_USER_AGENT,
                                         requeueAttempt: job.userData?.requeueAttempt ?? 0,
                                     },
                                 })),
@@ -387,7 +398,11 @@ async function main() {
                             await enqueueLinks({
                                 urls: [nextPage],
                                 transformRequestFunction: (req) => {
-                                    req.userData = { referer: request.url };
+                                    req.userData = {
+                                        referer: request.url,
+                                        userAgent: request.userData?.userAgent || DEFAULT_USER_AGENT,
+                                        requeueAttempt: 0,
+                                    };
                                     return req;
                                 },
                             });
@@ -560,6 +575,7 @@ async function main() {
                             userData: {
                                 ...request.userData,
                                 referer: request.userData?.referer || REFERER_FALLBACK,
+                                userAgent: request.userData?.userAgent || DEFAULT_USER_AGENT,
                                 requeueAttempt: requeueAttempt + 1,
                             },
                         });
@@ -598,7 +614,7 @@ async function main() {
             },
         });
 
-        await crawler.run(initial);
+        await crawler.run();
 
         log.info(`TotalJobs scraper finished. Saved ${saved} jobs from ${pagesVisited} pages.`);
     } catch (error) {
@@ -614,15 +630,4 @@ main().catch(err => {
     console.error(err);
     process.exit(1);
 });
-
-
-
-
-
-
-
-
-
-
-
 
