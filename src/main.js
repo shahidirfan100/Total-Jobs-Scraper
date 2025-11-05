@@ -122,16 +122,16 @@ async function main() {
         const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : 100;
         const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 10;
 
-        const maxRequestsPerMinute = Number.isFinite(+inputMaxRpm) ? Math.max(90, +inputMaxRpm) : 300;
-        const maxConcurrency = Number.isFinite(+inputMaxConcurrency) ? Math.max(4, Math.min(24, +inputMaxConcurrency)) : 18;
+        const maxRequestsPerMinute = Number.isFinite(+inputMaxRpm) ? Math.max(90, +inputMaxRpm) : 180;
+        const maxConcurrency = Number.isFinite(+inputMaxConcurrency) ? Math.max(4, Math.min(24, +inputMaxConcurrency)) : 10;
         const minConcurrency = Number.isFinite(+inputMinConcurrency)
             ? Math.max(2, Math.min(+inputMinConcurrency, maxConcurrency))
-            : Math.max(8, Math.min(12, Math.floor(maxConcurrency * 0.6)));
+            : Math.max(4, Math.min(6, Math.floor(maxConcurrency * 0.6)));
 
-        const navDelay = normalizeDelayRange(navigationDelayRange, { min: 10, max: 50 });
+        const navDelay = normalizeDelayRange(navigationDelayRange, { min: 50, max: 200 });
         const listDelay = normalizeDelayRange(listingDelayRange, { min: 50, max: 150 });
         const detailDelay = normalizeDelayRange(detailDelayRange, { min: 100, max: 250 });
-        const blockDelay = normalizeDelayRange(blockDelayRange, { min: 800, max: 1500 });
+        const blockDelay = normalizeDelayRange(blockDelayRange, { min: 1500, max: 3000 });
 
         const sessionPoolSize = Math.max(30, maxConcurrency * 3);
 
@@ -160,6 +160,12 @@ async function main() {
         const proxyConf = proxyConfiguration
             ? await Actor.createProxyConfiguration(proxyConfiguration)
             : undefined;
+        
+        if (proxyConf) {
+            log.info('✓ Proxy configuration enabled for anti-blocking');
+        } else {
+            log.warning('⚠ Running without proxies - may face rate limiting. Consider enabling Apify proxies for better results.');
+        }
 
         let saved = 0;
         let pagesVisited = 0;
@@ -173,11 +179,12 @@ async function main() {
             proxyConfiguration: proxyConf,
             maxRequestRetries: 4,
             useSessionPool: true,
+            persistCookiesPerSession: true,
             sessionPoolOptions: {
                 maxPoolSize: sessionPoolSize,
                 sessionOptions: {
-                    maxUsageCount: 25,
-                    maxErrorScore: 4,
+                    maxUsageCount: 20,
+                    maxErrorScore: 5,
                 },
             },
             maxConcurrency,
@@ -185,6 +192,8 @@ async function main() {
             requestHandlerTimeoutSecs: 90,
             navigationTimeoutSecs: 60,
             maxRequestsPerMinute,
+            ignoreSslErrors: true,
+            suggestResponseEncoding: 'utf-8',
             
             // Pre-navigation hook for stealth headers
             preNavigationHooks: [
@@ -218,6 +227,12 @@ async function main() {
             async requestHandler({ request, $, enqueueLinks, session, log: crawlerLog }) {
                 const isDetailPage = /\/job\/[^/]+\/[^/]+-job\d+/.test(request.url);
                 const isListPage = /\/jobs\//.test(request.url) && !isDetailPage;
+
+                // Skip if we've already reached our goal
+                if (saved >= RESULTS_WANTED) {
+                    crawlerLog.debug('Results target reached, skipping');
+                    return;
+                }
 
                 // LIST PAGE: extract job links and pagination
                 if (isListPage) {
@@ -281,7 +296,10 @@ async function main() {
 
                     // Enqueue job detail pages
                     if (collectDetails && jobLinks.length > 0) {
-                        const toEnqueue = jobLinks.slice(0, RESULTS_WANTED - saved);
+                        // Calculate how many more jobs we need
+                        const needed = RESULTS_WANTED - saved;
+                        // Enqueue extra to account for failures (1.5x buffer)
+                        const toEnqueue = jobLinks.slice(0, Math.ceil(needed * 1.5));
                         if (toEnqueue.length > 0) {
                             await enqueueLinks({
                                 urls: toEnqueue.map(j => j.url),
@@ -293,7 +311,7 @@ async function main() {
                                     return req;
                                 },
                             });
-                            crawlerLog.info(`Enqueued ${toEnqueue.length} job detail pages`);
+                            crawlerLog.info(`Enqueued ${toEnqueue.length} job detail pages (need ${needed} more jobs)`);
                         }
                     } else if (!collectDetails && jobLinks.length > 0) {
                         // Save minimal data from listing
@@ -315,7 +333,7 @@ async function main() {
                     }
 
                     // Pagination: follow next page link
-                    if (saved < RESULTS_WANTED && pagesVisited < MAX_PAGES) {
+                    if (pagesVisited < MAX_PAGES) {
                         // Extract current page number from URL
                         const currentUrl = new URL(request.url);
                         const currentPage = parseInt(currentUrl.searchParams.get('page') || '1', 10);
@@ -347,6 +365,31 @@ async function main() {
                     }
 
                     const seed = request.userData?.seed || {};
+                    
+                    // Check if we got valid HTML (not blocked/error page)
+                    const htmlText = $.html();
+                    const isBlockedOrError = !htmlText || htmlText.length < 500 || 
+                        /access denied|blocked|captcha|error/i.test(htmlText.substring(0, 1000));
+                    
+                    // If blocked, save seed data and continue
+                    if (isBlockedOrError && seed.title) {
+                        const fallbackRecord = {
+                            title: seed.title,
+                            company: seed.company,
+                            location: seed.location,
+                            salary: seed.salary,
+                            date_posted: seed.date_posted,
+                            job_type: null,
+                            job_category: null,
+                            description_html: null,
+                            description_text: null,
+                            job_url: request.loadedUrl || request.url,
+                        };
+                        await Dataset.pushData(fallbackRecord);
+                        saved++;
+                        crawlerLog.info(`Saved job #${saved} (from listing data): ${fallbackRecord.title}`);
+                        return;
+                    }
 
                     // Try JSON-LD structured data first (best quality)
                     const jsonLd = extractJsonLd($, request.url);
@@ -431,18 +474,30 @@ async function main() {
 
             // Error handling with smart retry
             failedRequestHandler: async ({ request, session }, error) => {
-                failedUrls.add(request.url);
                 const message = error?.message || '';
                 const statusCode = error?.statusCode || 0;
-                const is403or429 = statusCode === 403 || statusCode === 429 || message.includes('403') || message.includes('429');
+                const is403or429 = statusCode === 403 || statusCode === 429 || message.includes('403') || message.includes('429') || message.includes('blocked');
                 const isTimeout = message.includes('timed out') || message.includes('timeout');
+                const isSocketError = message.includes('socket hang up') || message.includes('ECONNRESET') || message.includes('ETIMEDOUT');
                 const isHttp2Error = message.includes('NGHTTP2');
-                const isNetworkError = isHttp2Error || message.includes('socket') || message.includes('ECONNRESET') || message.includes('ETIMEDOUT');
+                const isNetworkError = isHttp2Error || isSocketError || message.includes('ENOTFOUND');
+                
+                // Only add to failed set if it's not a recoverable error
+                const isRecoverable = is403or429 || isTimeout || isNetworkError;
+                if (!isRecoverable) {
+                    failedUrls.add(request.url);
+                }
                 
                 if (is403or429) {
-                    log.warning(`Blocked (403/429) on ${request.url} - rotating session after delay`);
+                    log.warning(`Blocked (403/429) on ${request.url} - rotating session`);
                     session?.retire();
+                    // Longer delay on blocks
                     await randomDelay(blockDelay.min, blockDelay.max);
+                } else if (isSocketError) {
+                    log.warning(`Socket error on ${request.url} (attempt ${request.retryCount + 1}) - will retry`);
+                    session?.markBad();
+                    // Short delay for socket issues
+                    await randomDelay(800, 1500);
                 } else if (isTimeout) {
                     log.warning(`Timeout on ${request.url} (attempt ${request.retryCount + 1}) - will retry`);
                     session?.markBad();
@@ -454,8 +509,11 @@ async function main() {
                 } else if (isNetworkError) {
                     log.debug(`Network error on ${request.url}: ${error.message}`);
                     session?.markBad();
+                    await randomDelay(400, 900);
                 } else {
                     log.error(`Failed ${request.url} after ${request.retryCount + 1} retries: ${error.message}`);
+                    // Don't retry non-network errors
+                    failedUrls.add(request.url);
                 }
             },
         });
