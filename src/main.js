@@ -137,44 +137,57 @@ async function main() {
         // Stealth best practices: balanced speed and stealth
         const crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 3,
+            maxRequestRetries: 5,
             useSessionPool: true,
             sessionPoolOptions: {
-                maxPoolSize: 20,
+                maxPoolSize: 50,
                 sessionOptions: {
-                    maxUsageCount: 10,
-                    maxErrorScore: 3,
+                    maxUsageCount: 5,
+                    maxErrorScore: 1,
                 },
             },
-            maxConcurrency: 5,
-            minConcurrency: 2,
-            requestHandlerTimeoutSecs: 60,
-            navigationTimeoutSecs: 30,
-            maxRequestsPerMinute: 120,
+            maxConcurrency: 3,
+            minConcurrency: 1,
+            requestHandlerTimeoutSecs: 90,
+            navigationTimeoutSecs: 60,
+            maxRequestsPerMinute: 60,
+            ignoreSslErrors: true,
+            persistCookiesPerSession: false,
             
             // Pre-navigation hook for stealth headers
             preNavigationHooks: [
-                async ({ request }, gotoOptions) => {
+                async ({ request, session }, gotoOptions) => {
                     // Realistic referer
                     const referer = request.userData?.referer || 'https://www.totaljobs.com/';
                     
+                    // Force HTTP/1.1 to avoid HTTP/2 errors
                     if (!gotoOptions.headers) gotoOptions.headers = {};
                     Object.assign(gotoOptions.headers, {
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                        'Accept-Language': 'en-GB,en;q=0.9',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                        'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
                         'Accept-Encoding': 'gzip, deflate, br',
                         'Referer': referer,
+                        'Connection': 'keep-alive',
+                        'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+                        'Sec-Ch-Ua-Mobile': '?0',
+                        'Sec-Ch-Ua-Platform': '"Windows"',
                         'Sec-Fetch-Dest': 'document',
                         'Sec-Fetch-Mode': 'navigate',
-                        'Sec-Fetch-Site': referer.includes('totaljobs') ? 'same-origin' : 'cross-site',
+                        'Sec-Fetch-Site': referer.includes('totaljobs') ? 'same-origin' : 'none',
                         'Sec-Fetch-User': '?1',
                         'Upgrade-Insecure-Requests': '1',
-                        'Cache-Control': 'no-cache',
-                        'Pragma': 'no-cache',
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
                     });
                     
-                    // Small network delay
-                    await randomDelay(50, 200);
+                    // Longer delay for stealth - mimic human behavior
+                    const retryCount = request.retryCount || 0;
+                    const baseDelay = retryCount > 0 ? getBackoffDelay(retryCount) : 1000;
+                    await randomDelay(baseDelay, baseDelay + 2000);
+                    
+                    // Retire session on repeated failures
+                    if (session && retryCount > 2) {
+                        session.markBad();
+                    }
                 },
             ],
 
@@ -185,13 +198,20 @@ async function main() {
                 // LIST PAGE: extract job links and pagination
                 if (isListPage) {
                     pagesVisited++;
+                    crawlerLog.info(`📄 Processing list page ${pagesVisited}/${MAX_PAGES}: ${request.url}`);
+                    
+                    if (saved >= RESULTS_WANTED) {
+                        crawlerLog.info(`✅ Reached target of ${RESULTS_WANTED} jobs, stopping pagination`);
+                        return;
+                    }
+                    
                     if (pagesVisited > MAX_PAGES) {
                         crawlerLog.info(`Reached max pages limit (${MAX_PAGES})`);
                         return;
                     }
 
-                    // Quick delay
-                    await randomDelay(300, 800);
+                    // Longer delay for list pages - mimic human reading time
+                    await randomDelay(2000, 4000);
 
                     // Debug pagination elements
                     const nextButtons = $('a:contains("Next")');
@@ -293,8 +313,8 @@ async function main() {
                         crawlerLog.info(`Saved ${toPush.length} jobs (total: ${saved})`);
                     }
 
-                    // Pagination: follow next page link
-                    if (pagesVisited < MAX_PAGES) {
+                    // Pagination: follow next page link - AGGRESSIVE APPROACH
+                    if (saved < RESULTS_WANTED && pagesVisited < MAX_PAGES) {
                         const currentUrlObj = new URL(request.url);
                         const currentPage = currentUrlObj.searchParams.has('page')
                             ? Number(currentUrlObj.searchParams.get('page'))
@@ -312,39 +332,70 @@ async function main() {
                             crawlerLog.info(`Found Next button: ${nextPageUrl}`);
                         }
 
-                        // Method 2: If no Next button, construct next page URL manually
+                        // Method 2: Look for numbered page links and find the next one
                         if (!nextPageUrl) {
-                            const nextPageNum = currentPage + 1;
-                            currentUrlObj.searchParams.set('page', nextPageNum.toString());
-                            nextPageUrl = currentUrlObj.href;
-                            crawlerLog.info(`Constructed next page URL: ${nextPageUrl}`);
+                            const pageLinks = $('a[href*="page="]');
+                            pageLinks.each((i, el) => {
+                                const href = $(el).attr('href');
+                                if (href) {
+                                    const match = href.match(/page=(\d+)/);
+                                    if (match) {
+                                        const pageNum = Number(match[1]);
+                                        if (pageNum === currentPage + 1) {
+                                            nextPageUrl = href.startsWith('http') 
+                                                ? href 
+                                                : `https://www.totaljobs.com${href.startsWith('/') ? href : '/' + href}`;
+                                            return false; // break
+                                        }
+                                    }
+                                }
+                            });
+                            if (nextPageUrl) {
+                                crawlerLog.info(`Found page link for page ${currentPage + 1}: ${nextPageUrl}`);
+                            }
                         }
 
-                        // Validate the next page URL
+                        // Method 3: If no Next button or page link, construct next page URL manually
+                        if (!nextPageUrl) {
+                            const nextPageNum = currentPage + 1;
+                            const nextUrlObj = new URL(request.url);
+                            nextUrlObj.searchParams.set('page', nextPageNum.toString());
+                            nextPageUrl = nextUrlObj.href;
+                            crawlerLog.info(`🔧 Constructed next page URL: ${nextPageUrl}`);
+                        }
+
+                        // Always try to enqueue next page if we haven't reached limits
                         if (nextPageUrl) {
                             const nextUrlObj = new URL(nextPageUrl);
-                            const nextPageNum = Number(nextUrlObj.searchParams.get('page'));
+                            const nextPageNum = nextUrlObj.searchParams.has('page') 
+                                ? Number(nextUrlObj.searchParams.get('page')) 
+                                : 2;
                             
-                            if (Number.isFinite(nextPageNum) && nextPageNum > currentPage && nextPageNum <= MAX_PAGES) {
+                            // More lenient validation - trust the URL construction
+                            if (nextPageNum > currentPage && nextPageNum <= MAX_PAGES) {
                                 if (!seenUrls.has(nextPageUrl)) {
                                     seenUrls.add(nextPageUrl);
                                     await enqueueLinks({
                                         urls: [nextPageUrl],
                                         transformRequestFunction: (req) => {
-                                            req.userData = { referer: request.url };
+                                            req.userData = { referer: request.url, isListPage: true };
+                                            // Higher priority for pagination
+                                            req.retryCount = 0;
                                             return req;
                                         },
                                     });
-                                    crawlerLog.info(`✅ Enqueued next page ${nextPageNum}: ${nextPageUrl}`);
+                                    crawlerLog.info(`✅ Enqueued next page ${nextPageNum}/${MAX_PAGES} (${saved}/${RESULTS_WANTED} jobs saved)`);
                                 } else {
-                                    crawlerLog.debug(`⏭️ Already visited: ${nextPageUrl}`);
+                                    crawlerLog.debug(`⏭️ Page already queued: ${nextPageUrl}`);
                                 }
                             } else {
-                                crawlerLog.info(`Next page ${nextPageNum} exceeds max pages (${MAX_PAGES}) or is invalid`);
+                                crawlerLog.info(`🛑 Page ${nextPageNum} exceeds limits (max: ${MAX_PAGES})`);
                             }
                         } else {
-                            crawlerLog.info('No next page found - pagination ended');
+                            crawlerLog.warning('⚠️ Could not determine next page URL');
                         }
+                    } else if (saved >= RESULTS_WANTED) {
+                        crawlerLog.info(`🎯 Target reached (${saved}/${RESULTS_WANTED} jobs), stopping pagination`);
                     }
                 }
 
@@ -355,8 +406,8 @@ async function main() {
                         return;
                     }
 
-                    // Quick delay
-                    await randomDelay(400, 1000);
+                    // Longer delay for detail pages - mimic human reading time
+                    await randomDelay(2500, 5000);
 
                     const seed = request.userData?.seed || {};
 
@@ -441,20 +492,46 @@ async function main() {
                 }
             },
 
-            // Error handling with smart retry
-            failedRequestHandler: async ({ request }, error) => {
-                failedUrls.add(request.url);
+            // Error handling with smart retry - DON'T STOP CRAWLING
+            failedRequestHandler: async ({ request, session }, error) => {
                 const is403or429 = error.message.includes('403') || error.message.includes('429');
-                const isNetworkError = error.message.includes('NGHTTP2') || error.message.includes('socket') || error.message.includes('ECONNRESET');
+                const isNetworkError = error.message.includes('NGHTTP2') || error.message.includes('socket') || 
+                                      error.message.includes('ECONNRESET') || error.message.includes('ETIMEDOUT') ||
+                                      error.message.includes('ENOTFOUND') || error.message.includes('EAI_AGAIN');
+                const isListPage = request.userData?.isListPage || /\/jobs\//.test(request.url);
                 
                 if (is403or429) {
-                    log.warning(`Blocked on ${request.url} - rotating session`);
-                    await randomDelay(2000, 4000);
+                    log.warning(`🚫 Blocked (${error.message.includes('403') ? '403' : '429'}) on ${request.url} - retry ${request.retryCount}/5`);
+                    // Mark session as bad to force rotation
+                    if (session) {
+                        session.markBad();
+                    }
+                    // Longer backoff for blocking
+                    await randomDelay(5000, 10000);
+                    
+                    // For list pages, try to re-enqueue with fresh session
+                    if (isListPage && request.retryCount < 3) {
+                        log.info(`🔄 Re-enqueueing list page with fresh session`);
+                        // Will be retried automatically by crawler
+                    }
                 } else if (isNetworkError) {
-                    log.debug(`Network error on ${request.url}: ${error.message}`);
+                    log.warning(`🌐 Network error on ${request.url}: ${error.message.substring(0, 100)}`);
+                    // Mark session as bad for connection errors
+                    if (session) {
+                        session.markBad();
+                    }
+                    // Backoff for network issues
+                    await randomDelay(3000, 6000);
                 } else {
-                    log.error(`Failed ${request.url} after ${request.retryCount} retries: ${error.message}`);
+                    log.error(`❌ Failed ${request.url} after ${request.retryCount} retries: ${error.message.substring(0, 150)}`);
                 }
+                
+                // Mark as failed but DON'T add to failedUrls if it's a list page - we want to keep trying
+                if (!isListPage) {
+                    failedUrls.add(request.url);
+                }
+                
+                log.info(`📊 Progress: ${saved}/${RESULTS_WANTED} jobs saved, ${pagesVisited}/${MAX_PAGES} pages visited`);
             },
         });
 
