@@ -2,9 +2,7 @@
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
-import { gotScraping } from 'got-scraping';
 import { HeaderGenerator } from 'header-generator';
-import { JSDOM } from 'jsdom';
 
 // Selector documentation based on actual Totaljobs.com structure (Nov 2025)
 // LISTING PAGE: Job links found as: <a href="/job/[title]/[company]-job[id]">
@@ -85,7 +83,13 @@ function getBackoffDelay(retryCount) {
 }
 
 const headerGenerator = new HeaderGenerator({
-  browsers: ['chrome_122'],
+  browsers: [
+    {
+      name: 'chrome',
+      minVersion: 120,
+      maxVersion: 122
+    }
+  ],
   devices: ['desktop'],
   operatingSystems: ['windows'],
 });
@@ -109,59 +113,6 @@ const injectDynamicHeaders = (options) => {
   options.headers['sec-fetch-mode'] ??= 'navigate';
   options.headers['sec-fetch-user'] ??= '?1';
 };
-
-const gotScrapingClient = gotScraping.extend({
-  http2: true,
-  dnsCache: true,
-  timeout: { request: 60000 },
-  retry: { limit: 2 },
-  hooks: {
-    beforeRequest: [injectDynamicHeaders],
-  },
-});
-
-async function warmUpTotalJobs(url, proxyConfiguration) {
-  if (!url) return '';
-  try {
-    const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
-    const response = await gotScrapingClient(url, {
-      proxyUrl,
-      followRedirect: true,
-      throwHttpErrors: false,
-    });
-    const setCookies = response.headers['set-cookie'];
-    if (setCookies && setCookies.length) {
-      return Array.isArray(setCookies) ? setCookies.join('; ') : setCookies;
-    }
-  } catch (err) {
-    log.warning(`Warm-up fetch failed: ${err.message}`);
-  }
-  return '';
-}
-
-function extractDescriptionWithJsdom(html) {
-  if (!html) return '';
-  const dom = new JSDOM(html);
-  const doc = dom.window.document;
-  const selectors = [
-    '[data-automation="job-description"]',
-    '.job-description',
-    '[id*="description"]',
-    '[class*="description"]',
-    'section',
-    'article',
-  ];
-  for (const selector of selectors) {
-    const node = doc.querySelector(selector);
-    if (node) {
-      const text = node.textContent?.trim() || '';
-      if (text.length > 150) {
-        return node.innerHTML.trim();
-      }
-    }
-  }
-  return '';
-}
 
 // Single-entrypoint main
 await Actor.init();
@@ -207,21 +158,16 @@ async function main() {
         const startRequests = initial.map((url) => ({
             url,
             userData: { referer: 'https://www.totaljobs.com/' },
-            headers: { referer: 'https://www.totaljobs.com/' },
+            headers: {
+                'referer': 'https://www.totaljobs.com/',
+                'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
+            },
         }));
 
         // Proxy configuration
         const proxyConf = proxyConfiguration
             ? await Actor.createProxyConfiguration(proxyConfiguration)
             : undefined;
-
-        if (initial.length > 0) {
-            const warmupUrl = initial[0];
-            warmupCookieHeader = await warmUpTotalJobs(warmupUrl, proxyConf);
-            if (warmupCookieHeader) {
-                log.info('🍪 Captured warm-up cookies from warm-up request');
-            }
-        }
 
         let saved = 0;
         let pagesVisited = 0;
@@ -252,15 +198,7 @@ async function main() {
             maxRequestsPerMinute: 150,
             ignoreSslErrors: true,
             persistCookiesPerSession: false,
-            gotOptions: {
-                http2: true,
-                dnsCache: true,
-                timeout: { request: 60000 },
-                retry: { limit: 2 },
-                hooks: {
-                    beforeRequest: [injectDynamicHeaders],
-                },
-            },
+            additionalMimeTypes: ['application/json'],
             preNavigationHooks: [
                 async ({ request, session }) => {
                     const retryCount = request.retryCount || 0;
@@ -275,6 +213,19 @@ async function main() {
             ],
 
             async requestHandler({ request, $, enqueueLinks, session, log: crawlerLog }) {
+                // Inject dynamic headers for this request
+                const dynamicHeaders = headerGenerator.getHeaders();
+                request.headers = {
+                    ...dynamicHeaders,
+                    ...request.headers,
+                    'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
+                    'cache-control': 'no-cache',
+                    'pragma': 'no-cache',
+                    'sec-fetch-site': 'same-origin',
+                    'sec-fetch-mode': 'navigate',
+                    'sec-fetch-user': '?1',
+                };
+
                 const isDetailPage = /\/job\/[^/]+\/[^/]+-job\d+/.test(request.url);
                 const isListPage = /\/jobs\//.test(request.url) && !isDetailPage;
 
