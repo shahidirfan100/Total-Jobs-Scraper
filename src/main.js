@@ -271,7 +271,9 @@ async function main() {
             persistCookiesPerSession: false,
             additionalMimeTypes: ['application/json'],
             // Force HTTP/1.1 to avoid HTTP/2 issues
-            forceHTTP1: true,
+            httpClient: {
+                forceHttp1: true,
+            },
             // Better retry configuration
             retryOnBlocked: true,
             preNavigationHooks: [
