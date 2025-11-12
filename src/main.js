@@ -193,6 +193,19 @@ async function main() {
                     // Quick delay
                     await randomDelay(300, 800);
 
+                    // Debug pagination elements
+                    const nextButtons = $('a:contains("Next")');
+                    const pageLinks = $('a[href*="?page="]');
+                    const allLinks = $('a[href*="page"]');
+                    crawlerLog.info(`Page ${pagesVisited}: Found ${nextButtons.length} Next buttons, ${pageLinks.length} page links, ${allLinks.length} total page-related links`);
+                    
+                    if (nextButtons.length > 0) {
+                        nextButtons.each((i, el) => {
+                            const href = $(el).attr('href');
+                            crawlerLog.debug(`Next button ${i}: href="${href}", text="${$(el).text().trim()}"`);
+                        });
+                    }
+
                     // Find all job links: /job/[title]/[company]-job[id]
                     const jobLinks = [];
                     $('a[href^="/job/"]').each((i, el) => {
@@ -281,59 +294,56 @@ async function main() {
                     }
 
                     // Pagination: follow next page link
-                    if (saved < RESULTS_WANTED && pagesVisited < MAX_PAGES) {
+                    if (pagesVisited < MAX_PAGES) {
                         const currentUrlObj = new URL(request.url);
                         const currentPage = currentUrlObj.searchParams.has('page')
                             ? Number(currentUrlObj.searchParams.get('page'))
                             : 1;
 
-                        const candidateUrls = [];
+                        let nextPageUrl = null;
 
-                        // Gather numbered pagination links
-                        $('a[href*="?page="]').each((i, el) => {
-                            const href = $(el).attr('href');
-                            if (!href || !href.match(/page=\d+/)) return;
-                            const fullHref = href.startsWith('http')
-                                ? href
-                                : `https://www.totaljobs.com${href.startsWith('/') ? href : '/' + href}`;
-                            candidateUrls.push(fullHref);
-                        });
-
-                        // Fallback to "Next" button if present
-                        const nextLink = $('a:contains("Next")').first().attr('href');
-                        if (nextLink) {
-                            const fullNext = nextLink.startsWith('http')
-                                ? nextLink
-                                : `https://www.totaljobs.com${nextLink.startsWith('/') ? nextLink : '/' + nextLink}`;
-                            candidateUrls.push(fullNext);
+                        // Method 1: Look for "Next" button with href
+                        const nextButton = $('a:contains("Next")').first();
+                        if (nextButton.length && nextButton.attr('href')) {
+                            const nextHref = nextButton.attr('href');
+                            nextPageUrl = nextHref.startsWith('http') 
+                                ? nextHref 
+                                : `https://www.totaljobs.com${nextHref.startsWith('/') ? nextHref : '/' + nextHref}`;
+                            crawlerLog.info(`Found Next button: ${nextPageUrl}`);
                         }
 
-                        const nextPageUrl = candidateUrls
-                            .map((href) => {
-                                try {
-                                    return new URL(href);
-                                } catch {
-                                    return null;
-                                }
-                            })
-                            .filter((urlObj) => {
-                                if (!urlObj) return false;
-                                const pageVal = Number(urlObj.searchParams.get('page'));
-                                return Number.isFinite(pageVal) && pageVal > currentPage && pageVal <= MAX_PAGES;
-                            })
-                            .sort((a, b) => Number(a.searchParams.get('page')) - Number(b.searchParams.get('page')))
-                            .map((urlObj) => urlObj.href)[0];
+                        // Method 2: If no Next button, construct next page URL manually
+                        if (!nextPageUrl) {
+                            const nextPageNum = currentPage + 1;
+                            currentUrlObj.searchParams.set('page', nextPageNum.toString());
+                            nextPageUrl = currentUrlObj.href;
+                            crawlerLog.info(`Constructed next page URL: ${nextPageUrl}`);
+                        }
 
-                        if (nextPageUrl && !seenUrls.has(nextPageUrl)) {
-                            seenUrls.add(nextPageUrl);
-                            await enqueueLinks({
-                                urls: [nextPageUrl],
-                                transformRequestFunction: (req) => {
-                                    req.userData = { referer: request.url };
-                                    return req;
-                                },
-                            });
-                            crawlerLog.info(`Enqueued next page: ${nextPageUrl}`);
+                        // Validate the next page URL
+                        if (nextPageUrl) {
+                            const nextUrlObj = new URL(nextPageUrl);
+                            const nextPageNum = Number(nextUrlObj.searchParams.get('page'));
+                            
+                            if (Number.isFinite(nextPageNum) && nextPageNum > currentPage && nextPageNum <= MAX_PAGES) {
+                                if (!seenUrls.has(nextPageUrl)) {
+                                    seenUrls.add(nextPageUrl);
+                                    await enqueueLinks({
+                                        urls: [nextPageUrl],
+                                        transformRequestFunction: (req) => {
+                                            req.userData = { referer: request.url };
+                                            return req;
+                                        },
+                                    });
+                                    crawlerLog.info(`✅ Enqueued next page ${nextPageNum}: ${nextPageUrl}`);
+                                } else {
+                                    crawlerLog.debug(`⏭️ Already visited: ${nextPageUrl}`);
+                                }
+                            } else {
+                                crawlerLog.info(`Next page ${nextPageNum} exceeds max pages (${MAX_PAGES}) or is invalid`);
+                            }
+                        } else {
+                            crawlerLog.info('No next page found - pagination ended');
                         }
                     }
                 }
