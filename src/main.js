@@ -2,6 +2,9 @@
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
+import { gotScraping } from 'got-scraping';
+import HeaderGenerator from 'header-generator';
+import { JSDOM } from 'jsdom';
 
 // Selector documentation based on actual Totaljobs.com structure (Nov 2025)
 // LISTING PAGE: Job links found as: <a href="/job/[title]/[company]-job[id]">
@@ -81,6 +84,85 @@ function getBackoffDelay(retryCount) {
   return Math.min(1000 * Math.pow(2, retryCount) + Math.random() * 1000, 10000);
 }
 
+const headerGenerator = new HeaderGenerator({
+  browsers: ['chrome_122'],
+  devices: ['desktop'],
+  operatingSystems: ['windows'],
+});
+
+let warmupCookieHeader = '';
+
+const injectDynamicHeaders = (options) => {
+  options.headers = options.headers || {};
+  const dynamicHeaders = headerGenerator.getHeaders();
+  if (warmupCookieHeader) {
+    dynamicHeaders.cookie = warmupCookieHeader;
+  }
+  options.headers = {
+    ...dynamicHeaders,
+    ...options.headers,
+  };
+  options.headers['accept-language'] ??= 'en-GB,en-US;q=0.9,en;q=0.8';
+  options.headers['cache-control'] ??= 'no-cache';
+  options.headers['pragma'] ??= 'no-cache';
+  options.headers['sec-fetch-site'] ??= 'same-origin';
+  options.headers['sec-fetch-mode'] ??= 'navigate';
+  options.headers['sec-fetch-user'] ??= '?1';
+};
+
+const gotScrapingClient = gotScraping.extend({
+  http2: true,
+  dnsCache: true,
+  timeout: { request: 60000 },
+  retry: { limit: 2 },
+  hooks: {
+    beforeRequest: [injectDynamicHeaders],
+  },
+});
+
+async function warmUpTotalJobs(url, proxyConfiguration) {
+  if (!url) return '';
+  try {
+    const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
+    const response = await gotScrapingClient(url, {
+      proxyUrl,
+      followRedirect: true,
+      throwHttpErrors: false,
+    });
+    const setCookies = response.headers['set-cookie'];
+    if (setCookies && setCookies.length) {
+      return Array.isArray(setCookies) ? setCookies.join('; ') : setCookies;
+    }
+  } catch (err) {
+    log.warning(`Warm-up fetch failed: ${err.message}`);
+  }
+  return '';
+}
+
+function extractDescriptionWithJsdom(html) {
+  if (!html) return '';
+  const dom = new JSDOM(html);
+  const doc = dom.window.document;
+  const selectors = [
+    '[data-automation="job-description"]',
+    '.job-description',
+    '[id*="description"]',
+    '[class*="description"]',
+    'section',
+    'article',
+  ];
+  for (const selector of selectors) {
+    const node = doc.querySelector(selector);
+    if (node) {
+      const text = node.textContent?.trim() || '';
+      if (text.length > 150) {
+        return node.innerHTML.trim();
+      }
+    }
+  }
+  return '';
+}
+
 // Single-entrypoint main
 await Actor.init();
 
@@ -122,10 +204,24 @@ async function main() {
         log.info(`TotalJobs scraper started with ${initial.length} start URL(s)`);
         log.info(`Target: ${RESULTS_WANTED} jobs, max ${MAX_PAGES} pages, collectDetails: ${collectDetails}`);
 
+        const startRequests = initial.map((url) => ({
+            url,
+            userData: { referer: 'https://www.totaljobs.com/' },
+            headers: { referer: 'https://www.totaljobs.com/' },
+        }));
+
         // Proxy configuration
         const proxyConf = proxyConfiguration
             ? await Actor.createProxyConfiguration(proxyConfiguration)
             : undefined;
+
+        if (initial.length > 0) {
+            const warmupUrl = initial[0];
+            warmupCookieHeader = await warmUpTotalJobs(warmupUrl, proxyConf);
+            if (warmupCookieHeader) {
+                log.info('🍪 Captured warm-up cookies from warm-up request');
+            }
+        }
 
         let saved = 0;
         let pagesVisited = 0;
@@ -156,43 +252,22 @@ async function main() {
             maxRequestsPerMinute: 150,
             ignoreSslErrors: true,
             persistCookiesPerSession: false,
-            
-            // Pre-navigation hook for stealth headers
+            gotOptions: {
+                http2: true,
+                dnsCache: true,
+                timeout: { request: 60000 },
+                retry: { limit: 2 },
+                hooks: {
+                    beforeRequest: [injectDynamicHeaders],
+                },
+            },
             preNavigationHooks: [
-                async ({ request, session }, gotoOptions) => {
-                    // Realistic referer
-                    const referer = request.userData?.referer || 'https://www.totaljobs.com/';
-                    
-                    // Force HTTP/1.1 to avoid HTTP/2 errors
-                    if (!gotoOptions.headers) gotoOptions.headers = {};
-                    Object.assign(gotoOptions.headers, {
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                        'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
-                        'Accept-Encoding': 'gzip, deflate, br',
-                        'Referer': referer,
-                        'Connection': 'keep-alive',
-                        'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-                        'Sec-Ch-Ua-Mobile': '?0',
-                        'Sec-Ch-Ua-Platform': '"Windows"',
-                        'Sec-Fetch-Dest': 'document',
-                        'Sec-Fetch-Mode': 'navigate',
-                        'Sec-Fetch-Site': referer.includes('totaljobs') ? 'same-origin' : 'none',
-                        'Sec-Fetch-User': '?1',
-                        'Upgrade-Insecure-Requests': '1',
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                    });
-                    
-                    // Smart delay - longer on retries, shorter for normal requests
+                async ({ request, session }) => {
                     const retryCount = request.retryCount || 0;
-                    if (retryCount > 0) {
-                        const backoffDelay = getBackoffDelay(retryCount);
-                        await randomDelay(backoffDelay, backoffDelay + 1000);
-                    } else {
-                        // Faster for first attempt
-                        await randomDelay(500, 1500);
-                    }
-                    
-                    // Retire session on repeated failures
+                    const delayBase = retryCount > 0
+                        ? getBackoffDelay(retryCount)
+                        : Math.floor(Math.random() * 500) + 600;
+                    await randomDelay(delayBase, delayBase + 800);
                     if (session && retryCount > 2) {
                         session.markBad();
                     }
@@ -297,6 +372,8 @@ async function main() {
                                     if (match) {
                                         req.userData = match.userData;
                                     }
+                                    req.headers = req.headers || {};
+                                    req.headers.referer = request.url;
                                     return req;
                                 },
                             });
@@ -387,6 +464,8 @@ async function main() {
                                         urls: [nextPageUrl],
                                         transformRequestFunction: (req) => {
                                             req.userData = { referer: request.url, isListPage: true };
+                                            req.headers = req.headers || {};
+                                            req.headers.referer = request.url;
                                             // Higher priority for pagination
                                             req.retryCount = 0;
                                             return req;
@@ -543,7 +622,7 @@ async function main() {
             },
         });
 
-        await crawler.run(initial);
+        await crawler.run(startRequests);
 
         // Final stats for QA and monitoring
         const stats = {
