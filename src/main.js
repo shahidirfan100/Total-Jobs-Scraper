@@ -71,6 +71,19 @@ function extractJsonLd($, url) {
   return null;
 }
 
+// Utility: Random delay with jitter for anti-detection
+async function randomDelay(minMs, maxMs) {
+  const delay = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+  await new Promise(resolve => setTimeout(resolve, delay));
+}
+
+// Utility: Exponential backoff delay for retries
+function getBackoffDelay(retryCount) {
+  // Exponential backoff: 2^retryCount * 1000ms, capped at 30 seconds
+  const baseDelay = Math.min(Math.pow(2, retryCount) * 1000, 30000);
+  return Math.floor(baseDelay + Math.random() * 2000); // Add jitter
+}
+
 // Utility: Try API-based job fetching as fallback
 async function tryApiFetch(keyword, location, page = 1, proxyConf) {
   try {
@@ -266,16 +279,12 @@ async function main() {
             minConcurrency: Math.max(1, Math.floor(maxConcurrency / 3)),
             requestHandlerTimeoutSecs: 90,
             navigationTimeoutSecs: 60,
-            maxRequestsPerMinute: 100, // Reduce rate limiting
             ignoreSslErrors: true,
-            persistCookiesPerSession: false,
             additionalMimeTypes: ['application/json'],
             // Force HTTP/1.1 to avoid HTTP/2 issues
             httpClient: {
                 forceHttp1: true,
             },
-            // Better retry configuration
-            retryOnBlocked: true,
             preNavigationHooks: [
                 async ({ request, session }) => {
                     // Check circuit breaker
