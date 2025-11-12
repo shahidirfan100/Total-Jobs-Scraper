@@ -3,7 +3,7 @@ import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 import { gotScraping } from 'got-scraping';
-import HeaderGenerator from 'header-generator';
+import { HeaderGenerator } from 'header-generator';
 import { JSDOM } from 'jsdom';
 
 // Selector documentation based on actual Totaljobs.com structure (Nov 2025)
