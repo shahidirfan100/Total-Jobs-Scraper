@@ -71,15 +71,76 @@ function extractJsonLd($, url) {
   return null;
 }
 
-// Utility: random delay for human-like browsing (stealth)
-function randomDelay(min, max) {
-  const ms = Math.floor(Math.random() * (max - min + 1)) + min;
-  return new Promise(resolve => setTimeout(resolve, ms));
+// Utility: Try API-based job fetching as fallback
+async function tryApiFetch(keyword, location, page = 1, proxyConf) {
+  try {
+    // Try different API endpoints that TotalJobs might use
+    const apiUrls = [
+      `https://www.totaljobs.com/api/jobs/search?keywords=${encodeURIComponent(keyword)}&location=${encodeURIComponent(location)}&page=${page}`,
+      `https://www.totaljobs.com/api/v1/jobs?search=${encodeURIComponent(keyword)}&location=${encodeURIComponent(location)}&page=${page}`,
+      `https://www.totaljobs.com/jobs/api/search?query=${encodeURIComponent(keyword)}&location=${encodeURIComponent(location)}&page=${page}`,
+    ];
+
+    for (const apiUrl of apiUrls) {
+      try {
+        const proxyUrl = proxyConf ? await proxyConf.newUrl() : undefined;
+        const response = await fetch(apiUrl, {
+          method: 'GET',
+          headers: {
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.totaljobs.com/',
+          },
+          // Note: fetch doesn't support proxy directly, this is just for demonstration
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          log.info(`🎯 Found working API endpoint: ${apiUrl}`);
+          return data;
+        }
+      } catch (e) {
+        // Continue to next API URL
+      }
+    }
+  } catch (e) {
+    log.debug(`API fetch failed: ${e.message}`);
+  }
+  return null;
 }
 
-// Utility: exponential backoff for retries
-function getBackoffDelay(retryCount) {
-  return Math.min(1000 * Math.pow(2, retryCount) + Math.random() * 1000, 10000);
+// Circuit breaker for rate limiting detection
+let consecutiveFailures = 0;
+let lastFailureTime = 0;
+let circuitBreakerOpen = false;
+
+function updateCircuitBreaker(success) {
+  const now = Date.now();
+  if (success) {
+    consecutiveFailures = 0;
+    circuitBreakerOpen = false;
+  } else {
+    consecutiveFailures++;
+    lastFailureTime = now;
+    if (consecutiveFailures >= 3) {
+      circuitBreakerOpen = true;
+      log.warning(`🚫 Circuit breaker opened after ${consecutiveFailures} consecutive failures`);
+    }
+  }
+}
+
+function isCircuitBreakerOpen() {
+  if (!circuitBreakerOpen) return false;
+
+  // Auto-reset circuit breaker after 2 minutes
+  const now = Date.now();
+  if (now - lastFailureTime > 120000) {
+    circuitBreakerOpen = false;
+    consecutiveFailures = 0;
+    log.info('🔄 Circuit breaker auto-reset');
+    return false;
+  }
+  return true;
 }
 
 const headerGenerator = new HeaderGenerator({
@@ -94,7 +155,17 @@ const headerGenerator = new HeaderGenerator({
   operatingSystems: ['windows'],
 });
 
+// Rotating user agents for better anti-detection
+const userAgents = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+];
+
 let warmupCookieHeader = '';
+let userAgentIndex = 0;
 
 const injectDynamicHeaders = (options) => {
   options.headers = options.headers || {};
@@ -182,48 +253,78 @@ async function main() {
         // Stealth best practices: optimized speed with maintained stealth
         const crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 4,
+            maxRequestRetries: 6,
             useSessionPool: true,
             sessionPoolOptions: {
-                maxPoolSize: 100,
+                maxPoolSize: 150,
                 sessionOptions: {
-                    maxUsageCount: 15,
-                    maxErrorScore: 2,
+                    maxUsageCount: 8,
+                    maxErrorScore: 1,
                 },
             },
-            maxConcurrency: maxConcurrency,
-            minConcurrency: Math.max(1, Math.floor(maxConcurrency / 2)),
-            requestHandlerTimeoutSecs: 60,
-            navigationTimeoutSecs: 45,
-            maxRequestsPerMinute: 150,
+            maxConcurrency: Math.min(maxConcurrency, 6), // Reduce concurrency for better stealth
+            minConcurrency: Math.max(1, Math.floor(maxConcurrency / 3)),
+            requestHandlerTimeoutSecs: 90,
+            navigationTimeoutSecs: 60,
+            maxRequestsPerMinute: 100, // Reduce rate limiting
             ignoreSslErrors: true,
             persistCookiesPerSession: false,
             additionalMimeTypes: ['application/json'],
+            // Force HTTP/1.1 to avoid HTTP/2 issues
+            forceHTTP1: true,
+            // Better retry configuration
+            retryOnBlocked: true,
             preNavigationHooks: [
                 async ({ request, session }) => {
+                    // Check circuit breaker
+                    if (isCircuitBreakerOpen()) {
+                        log.warning('⏳ Circuit breaker open, waiting before next request...');
+                        await randomDelay(30000, 60000); // Wait 30-60 seconds
+                    }
+
                     const retryCount = request.retryCount || 0;
+                    // Longer delays for retries and between requests
                     const delayBase = retryCount > 0
-                        ? getBackoffDelay(retryCount)
-                        : Math.floor(Math.random() * 500) + 600;
-                    await randomDelay(delayBase, delayBase + 800);
-                    if (session && retryCount > 2) {
+                        ? getBackoffDelay(retryCount) + Math.random() * 2000
+                        : Math.floor(Math.random() * 800) + 1200;
+
+                    // Add extra delay for list pages to simulate reading time
+                    const isListPage = /\/jobs\//.test(request.url);
+                    const extraDelay = isListPage ? Math.random() * 2000 : 0;
+
+                    await randomDelay(delayBase + extraDelay, delayBase + extraDelay + 1500);
+                    if (session && retryCount > 3) {
                         session.markBad();
                     }
                 },
             ],
 
             async requestHandler({ request, $, enqueueLinks, session, log: crawlerLog }) {
-                // Inject dynamic headers for this request
+                // Enhanced header injection with rotating user agents and realistic fingerprinting
                 const dynamicHeaders = headerGenerator.getHeaders();
+                const rotatingUA = userAgents[userAgentIndex++ % userAgents.length];
+                const userAgent = dynamicHeaders['user-agent'] || rotatingUA;
+
                 request.headers = {
                     ...dynamicHeaders,
                     ...request.headers,
-                    'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
-                    'cache-control': 'no-cache',
-                    'pragma': 'no-cache',
-                    'sec-fetch-site': 'same-origin',
-                    'sec-fetch-mode': 'navigate',
-                    'sec-fetch-user': '?1',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                    'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache',
+                    'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+                    'Sec-Ch-Ua-Mobile': '?0',
+                    'Sec-Ch-Ua-Platform': '"Windows"',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': request.userData?.referer ? 'same-origin' : 'none',
+                    'Sec-Fetch-User': '?1',
+                    'Upgrade-Insecure-Requests': '1',
+                    'User-Agent': userAgent,
+                    // Force HTTP/1.1 and add more realistic headers
+                    'Connection': 'keep-alive',
+                    'DNT': '1', // Do Not Track - some sites respect this
                 };
 
                 const isDetailPage = /\/job\/[^/]+\/[^/]+-job\d+/.test(request.url);
@@ -311,6 +412,7 @@ async function main() {
                     });
 
                     crawlerLog.info(`Found ${jobLinks.length} unique job links on page ${pagesVisited}`);
+                    updateCircuitBreaker(true); // Mark list page success
 
                     // Enqueue job detail pages
                     if (collectDetails && jobLinks.length > 0) {
@@ -523,6 +625,7 @@ async function main() {
                     if (record.title && record.job_url) {
                         await Dataset.pushData(record);
                         saved++;
+                        updateCircuitBreaker(true); // Mark success
                         crawlerLog.info(`✓ Saved job #${saved}: ${record.title}`);
                     } else {
                         crawlerLog.warning(`Skipped incomplete job: ${request.url}`);
@@ -530,46 +633,51 @@ async function main() {
                 }
             },
 
-            // Error handling with smart retry - DON'T STOP CRAWLING
+            // Enhanced error handling with HTTP/2 specific fixes and circuit breaker
             failedRequestHandler: async ({ request, session }, error) => {
+                updateCircuitBreaker(false); // Mark failure
+
                 const is403or429 = error.message.includes('403') || error.message.includes('429');
-                const isNetworkError = error.message.includes('NGHTTP2') || error.message.includes('socket') || 
+                const isNetworkError = error.message.includes('NGHTTP2') || error.message.includes('socket') ||
                                       error.message.includes('ECONNRESET') || error.message.includes('ETIMEDOUT') ||
-                                      error.message.includes('ENOTFOUND') || error.message.includes('EAI_AGAIN');
+                                      error.message.includes('ENOTFOUND') || error.message.includes('EAI_AGAIN') ||
+                                      error.message.includes('Stream closed');
                 const isListPage = request.userData?.isListPage || /\/jobs\//.test(request.url);
-                
+
                 if (is403or429) {
-                    log.warning(`🚫 Blocked (${error.message.includes('403') ? '403' : '429'}) on ${request.url} - retry ${request.retryCount}/4`);
+                    log.warning(`🚫 Blocked (${error.message.includes('403') ? '403' : '429'}) on ${request.url} - retry ${request.retryCount}/6`);
                     // Mark session as bad to force rotation
                     if (session) {
                         session.markBad();
                     }
-                    // Optimized backoff for blocking
-                    await randomDelay(3000, 5000);
-                    
+                    // Longer backoff for blocking - exponential with jitter
+                    const backoffMs = getBackoffDelay(request.retryCount || 1) + Math.random() * 3000;
+                    await randomDelay(backoffMs, backoffMs + 2000);
+
                     // For list pages, try to re-enqueue with fresh session
-                    if (isListPage && request.retryCount < 2) {
-                        log.info(`🔄 Re-enqueueing list page with fresh session`);
+                    if (isListPage && request.retryCount < 4) {
+                        log.info(`🔄 Re-enqueueing list page with fresh session (attempt ${request.retryCount + 1})`);
                         // Will be retried automatically by crawler
                     }
                 } else if (isNetworkError) {
-                    log.warning(`🌐 Network error on ${request.url}: ${error.message.substring(0, 100)}`);
+                    log.warning(`🌐 Network/HTTP2 error on ${request.url}: ${error.message.substring(0, 80)}`);
                     // Mark session as bad for connection errors
                     if (session) {
                         session.markBad();
                     }
-                    // Optimized backoff for network issues
-                    await randomDelay(2000, 4000);
+                    // Shorter backoff for network issues but still significant
+                    const backoffMs = Math.min(5000 + (request.retryCount || 0) * 2000, 15000);
+                    await randomDelay(backoffMs, backoffMs + 3000);
                 } else {
-                    log.error(`❌ Failed ${request.url} after ${request.retryCount} retries: ${error.message.substring(0, 150)}`);
+                    log.error(`❌ Failed ${request.url} after ${request.retryCount} retries: ${error.message.substring(0, 120)}`);
                 }
-                
+
                 // Mark as failed but DON'T add to failedUrls if it's a list page - we want to keep trying
                 if (!isListPage) {
                     failedUrls.add(request.url);
                 }
-                
-                log.info(`📊 Progress: ${saved}/${RESULTS_WANTED} jobs saved, ${pagesVisited}/${MAX_PAGES} pages visited`);
+
+                log.info(`📊 Progress: ${saved}/${RESULTS_WANTED} jobs saved, ${pagesVisited}/${MAX_PAGES} pages visited, ${failedUrls.size} failed URLs, Circuit: ${circuitBreakerOpen ? 'OPEN' : 'CLOSED'}`);
             },
         });
 

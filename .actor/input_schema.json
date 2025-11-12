@@ -57,19 +57,21 @@
         "maxConcurrency": {
       "title": "Max concurrency",
       "type": "integer",
-      "description": "Maximum number of parallel requests. Default is 8 for optimal speed and stealth balance.",
+      "description": "Maximum number of parallel requests. Lower values (3-6) are more stealthy but slower. Default is 6 for optimal balance.",
       "editor": "number",
       "minimum": 1,
-      "maximum": 20,
-      "default": 8
+      "maximum": 10,
+      "default": 6
     },
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
-      "description": "Proxy settings for the crawler. It's recommended to use Apify Proxy for reliable scraping.",
+      "description": "Proxy settings for reliable scraping. Residential proxies are recommended for anti-blocking.",
       "editor": "proxy",
       "prefill": {
-        "useApifyProxy": true
+        "useApifyProxy": true,
+        "apifyProxyGroups": ["RESIDENTIAL"],
+        "apifyProxyCountry": "GB"
       }
     }
   },
