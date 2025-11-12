@@ -134,23 +134,26 @@ async function main() {
 
         await Dataset.open('totaljobs-jobs');
 
-        // Stealth best practices: balanced speed and stealth
+        // Determine optimal concurrency based on user input or defaults
+        const maxConcurrency = input.maxConcurrency || 8;
+        
+        // Stealth best practices: optimized speed with maintained stealth
         const crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 5,
+            maxRequestRetries: 4,
             useSessionPool: true,
             sessionPoolOptions: {
-                maxPoolSize: 50,
+                maxPoolSize: 100,
                 sessionOptions: {
-                    maxUsageCount: 5,
-                    maxErrorScore: 1,
+                    maxUsageCount: 15,
+                    maxErrorScore: 2,
                 },
             },
-            maxConcurrency: 3,
-            minConcurrency: 1,
-            requestHandlerTimeoutSecs: 90,
-            navigationTimeoutSecs: 60,
-            maxRequestsPerMinute: 60,
+            maxConcurrency: maxConcurrency,
+            minConcurrency: Math.max(1, Math.floor(maxConcurrency / 2)),
+            requestHandlerTimeoutSecs: 60,
+            navigationTimeoutSecs: 45,
+            maxRequestsPerMinute: 150,
             ignoreSslErrors: true,
             persistCookiesPerSession: false,
             
@@ -179,10 +182,15 @@ async function main() {
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
                     });
                     
-                    // Longer delay for stealth - mimic human behavior
+                    // Smart delay - longer on retries, shorter for normal requests
                     const retryCount = request.retryCount || 0;
-                    const baseDelay = retryCount > 0 ? getBackoffDelay(retryCount) : 1000;
-                    await randomDelay(baseDelay, baseDelay + 2000);
+                    if (retryCount > 0) {
+                        const backoffDelay = getBackoffDelay(retryCount);
+                        await randomDelay(backoffDelay, backoffDelay + 1000);
+                    } else {
+                        // Faster for first attempt
+                        await randomDelay(500, 1500);
+                    }
                     
                     // Retire session on repeated failures
                     if (session && retryCount > 2) {
@@ -210,8 +218,8 @@ async function main() {
                         return;
                     }
 
-                    // Longer delay for list pages - mimic human reading time
-                    await randomDelay(2000, 4000);
+                    // Optimized delay for list pages - balanced speed and stealth
+                    await randomDelay(800, 1500);
 
                     // Debug pagination elements
                     const nextButtons = $('a:contains("Next")');
@@ -406,8 +414,8 @@ async function main() {
                         return;
                     }
 
-                    // Longer delay for detail pages - mimic human reading time
-                    await randomDelay(2500, 5000);
+                    // Optimized delay for detail pages - balanced speed and stealth
+                    await randomDelay(1000, 2000);
 
                     const seed = request.userData?.seed || {};
 
@@ -501,16 +509,16 @@ async function main() {
                 const isListPage = request.userData?.isListPage || /\/jobs\//.test(request.url);
                 
                 if (is403or429) {
-                    log.warning(`🚫 Blocked (${error.message.includes('403') ? '403' : '429'}) on ${request.url} - retry ${request.retryCount}/5`);
+                    log.warning(`🚫 Blocked (${error.message.includes('403') ? '403' : '429'}) on ${request.url} - retry ${request.retryCount}/4`);
                     // Mark session as bad to force rotation
                     if (session) {
                         session.markBad();
                     }
-                    // Longer backoff for blocking
-                    await randomDelay(5000, 10000);
+                    // Optimized backoff for blocking
+                    await randomDelay(3000, 5000);
                     
                     // For list pages, try to re-enqueue with fresh session
-                    if (isListPage && request.retryCount < 3) {
+                    if (isListPage && request.retryCount < 2) {
                         log.info(`🔄 Re-enqueueing list page with fresh session`);
                         // Will be retried automatically by crawler
                     }
@@ -520,8 +528,8 @@ async function main() {
                     if (session) {
                         session.markBad();
                     }
-                    // Backoff for network issues
-                    await randomDelay(3000, 6000);
+                    // Optimized backoff for network issues
+                    await randomDelay(2000, 4000);
                 } else {
                     log.error(`❌ Failed ${request.url} after ${request.retryCount} retries: ${error.message.substring(0, 150)}`);
                 }
@@ -537,17 +545,46 @@ async function main() {
 
         await crawler.run(initial);
 
-        log.info(`✅ TotalJobs scraper finished. Saved ${saved} jobs from ${pagesVisited} pages.`);
+        // Final stats for QA and monitoring
+        const stats = {
+            jobsSaved: saved,
+            pagesVisited: pagesVisited,
+            targetJobs: RESULTS_WANTED,
+            maxPages: MAX_PAGES,
+            uniqueUrlsSeen: seenUrls.size,
+            failedUrls: failedUrls.size,
+        };
+        
+        log.info(`✅ TotalJobs scraper finished successfully!`);
+        log.info(`📊 Final Stats: ${JSON.stringify(stats, null, 2)}`);
+        
+        // Set output for Apify platform
+        await Actor.setValue('OUTPUT', stats);
+        
     } catch (error) {
         log.error(`Fatal error in main: ${error.message}`, { stack: error.stack });
+        await Actor.setValue('OUTPUT', { 
+            error: error.message, 
+            jobsSaved: 0,
+            status: 'FAILED'
+        });
         throw error;
-    } finally {
-        await Actor.exit();
     }
 }
 
-main().catch(err => {
-    log.error(`Unhandled error: ${err.message}`);
-    console.error(err);
-    process.exit(1);
-});
+main()
+    .then(() => {
+        log.info('Actor completed successfully');
+    })
+    .catch(async (err) => {
+        log.error(`Unhandled error: ${err.message}`);
+        console.error(err);
+        await Actor.setValue('OUTPUT', { 
+            error: err.message, 
+            stack: err.stack,
+            status: 'FAILED'
+        });
+    })
+    .finally(async () => {
+        await Actor.exit();
+    });

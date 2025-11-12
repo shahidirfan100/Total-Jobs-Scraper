@@ -12,7 +12,7 @@
           "salary",
           "job_type",
           "date_posted",
-          "url"
+          "job_url"
         ]
       },
       "display": {
@@ -42,7 +42,7 @@
             "label": "Posted",
             "format": "text"
           },
-          "url": {
+          "job_url": {
             "label": "URL",
             "format": "link"
           }
