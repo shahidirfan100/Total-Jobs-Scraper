@@ -204,6 +204,7 @@ await Actor.init();
 async function main() {
     try {
         const input = (await Actor.getInput()) || {};
+        log.info(`📥 Input received: ${JSON.stringify(input, null, 2)}`);
         const {
             keyword = 'admin',
             location = '',
@@ -252,6 +253,11 @@ async function main() {
         const proxyConf = proxyConfiguration
             ? await Actor.createProxyConfiguration(proxyConfiguration)
             : undefined;
+
+        log.info(`🔧 Proxy configuration: ${proxyConf ? 'configured' : 'not configured'}`);
+        if (proxyConf) {
+            log.info(`🔧 Proxy details: ${JSON.stringify(proxyConfiguration, null, 2)}`);
+        }
 
         let saved = 0;
         let pagesVisited = 0;
@@ -311,6 +317,9 @@ async function main() {
             ],
 
             async requestHandler({ request, $, enqueueLinks, session, log: crawlerLog }) {
+                crawlerLog.info(`🔍 Processing request: ${request.url}`);
+                crawlerLog.info(`📊 Request headers: ${JSON.stringify(request.headers, null, 2)}`);
+
                 // Enhanced header injection with rotating user agents and realistic fingerprinting
                 const dynamicHeaders = headerGenerator.getHeaders();
                 const rotatingUA = userAgents[userAgentIndex++ % userAgents.length];
@@ -341,11 +350,14 @@ async function main() {
                 const isDetailPage = /\/job\/[^/]+\/[^/]+-job\d+/.test(request.url);
                 const isListPage = /\/jobs\//.test(request.url) && !isDetailPage;
 
+                crawlerLog.info(`🏷️ Page type detection: isListPage=${isListPage}, isDetailPage=${isDetailPage}, URL=${request.url}`);
+
                 // LIST PAGE: extract job links and pagination
                 if (isListPage) {
                     pagesVisited++;
                     crawlerLog.info(`📄 Processing list page ${pagesVisited}/${MAX_PAGES}: ${request.url}`);
-                    
+                    crawlerLog.info(`📄 Page HTML length: ${$.html().length}, title: ${$('title').text()}`);
+
                     if (saved >= RESULTS_WANTED) {
                         crawlerLog.info(`✅ Reached target of ${RESULTS_WANTED} jobs, stopping pagination`);
                         return;
@@ -646,6 +658,9 @@ async function main() {
 
             // Enhanced error handling with HTTP/2 specific fixes and circuit breaker
             failedRequestHandler: async ({ request, session }, error) => {
+                log.error(`❌ Request failed: ${request.url} - ${error.message}`);
+                log.error(`❌ Error details: ${JSON.stringify(error, null, 2)}`);
+
                 updateCircuitBreaker(false); // Mark failure
 
                 const is403or429 = error.message.includes('403') || error.message.includes('429');
@@ -692,7 +707,12 @@ async function main() {
             },
         });
 
+        log.info(`🚀 Starting crawler with ${startRequests.length} requests`);
+        log.info(`🚀 Start requests: ${JSON.stringify(startRequests, null, 2)}`);
+
         await crawler.run(startRequests);
+
+        log.info(`✅ Crawler finished successfully`);
 
         // Final stats for QA and monitoring
         const stats = {
