@@ -211,8 +211,6 @@ async function main() {
         const seenPageUrls = new Set(startRequests.map((req) => req.url));
         const failedUrls = new Set();
 
-        const dataset = await Dataset.open('totaljobs-jobs');
-
         // Determine optimal concurrency based on user input or defaults
         const maxConcurrency = Number.isFinite(+input.maxConcurrency)
             ? Math.max(1, Math.min(12, +input.maxConcurrency))
@@ -223,6 +221,10 @@ async function main() {
             requestQueue,
             proxyConfiguration: proxyConf,
             maxRequestRetries: 4,
+            requestOptions: {
+                http2: false, // avoid NGHTTP2 issues from Totaljobs edge
+                timeout: { request: 45000 },
+            },
             useSessionPool: true,
             sessionPoolOptions: {
                 maxPoolSize: 100,
@@ -382,7 +384,7 @@ async function main() {
                             description_html: null,
                             description_text: null,
                         }));
-                        await dataset.pushData(toPush);
+                        await Dataset.pushData(toPush);
                         saved += toPush.length;
                         crawlerLog.info(`Saved ${toPush.length} jobs (total: ${saved})`);
                     }
@@ -559,7 +561,7 @@ async function main() {
 
                     // Validate: must have at least title and URL
                     if (record.title && record.job_url) {
-                        await dataset.pushData(record);
+                        await Dataset.pushData(record);
                         saved++;
                         crawlerLog.info(`✓ Saved job #${saved}: ${record.title}`);
                     } else {
