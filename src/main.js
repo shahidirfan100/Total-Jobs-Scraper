@@ -3,6 +3,11 @@ import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 import { HeaderGenerator } from 'header-generator';
+import { gotScraping } from 'got-scraping';
+
+const JOB_PATH_REGEX = /\/job\/[^/?#]+\/[^/?#]+-job\d+/i;
+const JOB_DETAIL_REGEX = /^https?:\/\/(?:www\.)?totaljobs\.com\/job\/[^/?#]+\/[^/?#]+-job\d+/i;
+const LIST_PATH_REGEX = /\/jobs\//i;
 
 // Selector documentation based on actual Totaljobs.com structure (Nov 2025)
 // LISTING PAGE: Job links found as: <a href="/job/[title]/[company]-job[id]">
@@ -114,6 +119,28 @@ const injectDynamicHeaders = (options) => {
   options.headers['sec-fetch-user'] ??= '?1';
 };
 
+async function warmUpSite(proxyConf) {
+  try {
+    const proxyUrl = proxyConf ? await proxyConf.newUrl() : undefined;
+    const response = await gotScraping({
+      url: 'https://www.totaljobs.com/',
+      proxyUrl,
+      timeout: { request: 15000 },
+      retry: { limit: 1 },
+      headers: headerGenerator.getHeaders(),
+    });
+    const setCookie = response.headers['set-cookie'];
+    if (setCookie) {
+      warmupCookieHeader = Array.isArray(setCookie)
+        ? setCookie.map((cookie) => cookie.split(';')[0]).join('; ')
+        : setCookie.split(';')[0];
+      log.info('Warm-up request succeeded, cookies captured');
+    }
+  } catch (err) {
+    log.warning(`Warm-up request failed: ${err.message}`);
+  }
+}
+
 // Single-entrypoint main
 await Actor.init();
 
@@ -155,32 +182,45 @@ async function main() {
         log.info(`TotalJobs scraper started with ${initial.length} start URL(s)`);
         log.info(`Target: ${RESULTS_WANTED} jobs, max ${MAX_PAGES} pages, collectDetails: ${collectDetails}`);
 
-        const startRequests = initial.map((url) => ({
-            url,
-            userData: { referer: 'https://www.totaljobs.com/' },
-            headers: {
-                'referer': 'https://www.totaljobs.com/',
-                'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
-            },
-        }));
+        const startRequests = initial.map((currentUrl) => {
+            const request = {
+                url: currentUrl,
+                userData: { referer: 'https://www.totaljobs.com/', isListPage: true },
+                headers: {
+                    referer: 'https://www.totaljobs.com/',
+                    'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
+                },
+            };
+            injectDynamicHeaders(request);
+            return request;
+        });
 
         // Proxy configuration
         const proxyConf = proxyConfiguration
             ? await Actor.createProxyConfiguration(proxyConfiguration)
             : undefined;
 
+        await warmUpSite(proxyConf);
+
+        const requestQueue = await Actor.openRequestQueue('totaljobs');
+        await requestQueue.addRequests(startRequests);
+
         let saved = 0;
         let pagesVisited = 0;
-        const seenUrls = new Set();
+        const seenJobUrls = new Set();
+        const seenPageUrls = new Set(startRequests.map((req) => req.url));
         const failedUrls = new Set();
 
-        await Dataset.open('totaljobs-jobs');
+        const dataset = await Dataset.open('totaljobs-jobs');
 
         // Determine optimal concurrency based on user input or defaults
-        const maxConcurrency = input.maxConcurrency || 8;
+        const maxConcurrency = Number.isFinite(+input.maxConcurrency)
+            ? Math.max(1, Math.min(12, +input.maxConcurrency))
+            : 6;
         
         // Stealth best practices: optimized speed with maintained stealth
         const crawler = new CheerioCrawler({
+            requestQueue,
             proxyConfiguration: proxyConf,
             maxRequestRetries: 4,
             useSessionPool: true,
@@ -197,7 +237,7 @@ async function main() {
             navigationTimeoutSecs: 45,
             maxRequestsPerMinute: 150,
             ignoreSslErrors: true,
-            persistCookiesPerSession: false,
+            persistCookiesPerSession: true,
             additionalMimeTypes: ['application/json'],
             preNavigationHooks: [
                 async ({ request, session }) => {
@@ -214,20 +254,15 @@ async function main() {
 
             async requestHandler({ request, $, enqueueLinks, session, log: crawlerLog }) {
                 // Inject dynamic headers for this request
-                const dynamicHeaders = headerGenerator.getHeaders();
-                request.headers = {
-                    ...dynamicHeaders,
-                    ...request.headers,
-                    'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
-                    'cache-control': 'no-cache',
-                    'pragma': 'no-cache',
-                    'sec-fetch-site': 'same-origin',
-                    'sec-fetch-mode': 'navigate',
-                    'sec-fetch-user': '?1',
-                };
+                injectDynamicHeaders(request);
 
-                const isDetailPage = /\/job\/[^/]+\/[^/]+-job\d+/.test(request.url);
-                const isListPage = /\/jobs\//.test(request.url) && !isDetailPage;
+                const loadedUrl = request.loadedUrl || request.url;
+                const urlObj = new URL(loadedUrl);
+                const isDetailPage = request.userData?.isDetailPage
+                    || JOB_DETAIL_REGEX.test(loadedUrl)
+                    || JOB_PATH_REGEX.test(urlObj.pathname);
+                const isListPage = request.userData?.isListPage
+                    || (LIST_PATH_REGEX.test(urlObj.pathname) && !isDetailPage);
 
                 // LIST PAGE: extract job links and pagination
                 if (isListPage) {
@@ -266,8 +301,8 @@ async function main() {
                         const href = $(el).attr('href');
                         if (href && href.match(/\/job\/[^/]+\/[^/]+-job\d+/)) {
                             const fullUrl = `https://www.totaljobs.com${href}`;
-                            if (!seenUrls.has(fullUrl) && !failedUrls.has(fullUrl)) {
-                                seenUrls.add(fullUrl);
+                            if (!seenJobUrls.has(fullUrl) && !failedUrls.has(fullUrl)) {
+                                seenJobUrls.add(fullUrl);
                                 
                                 // Extract basic info from listing (fallback if detail fails)
                                 const $link = $(el);
@@ -321,7 +356,10 @@ async function main() {
                                 transformRequestFunction: (req) => {
                                     const match = jobLinks.find(j => j.url === req.url);
                                     if (match) {
-                                        req.userData = match.userData;
+                                        req.userData = {
+                                            ...match.userData,
+                                            isDetailPage: true,
+                                        };
                                     }
                                     req.headers = req.headers || {};
                                     req.headers.referer = request.url;
@@ -344,7 +382,7 @@ async function main() {
                             description_html: null,
                             description_text: null,
                         }));
-                        await Dataset.pushData(toPush);
+                        await dataset.pushData(toPush);
                         saved += toPush.length;
                         crawlerLog.info(`Saved ${toPush.length} jobs (total: ${saved})`);
                     }
@@ -409,8 +447,8 @@ async function main() {
                             
                             // More lenient validation - trust the URL construction
                             if (nextPageNum > currentPage && nextPageNum <= MAX_PAGES) {
-                                if (!seenUrls.has(nextPageUrl)) {
-                                    seenUrls.add(nextPageUrl);
+                                if (!seenPageUrls.has(nextPageUrl)) {
+                                    seenPageUrls.add(nextPageUrl);
                                     await enqueueLinks({
                                         urls: [nextPageUrl],
                                         transformRequestFunction: (req) => {
@@ -521,7 +559,7 @@ async function main() {
 
                     // Validate: must have at least title and URL
                     if (record.title && record.job_url) {
-                        await Dataset.pushData(record);
+                        await dataset.pushData(record);
                         saved++;
                         crawlerLog.info(`✓ Saved job #${saved}: ${record.title}`);
                     } else {
@@ -531,49 +569,43 @@ async function main() {
             },
 
             // Error handling with smart retry - DON'T STOP CRAWLING
-            failedRequestHandler: async ({ request, session }, error) => {
-                const is403or429 = error.message.includes('403') || error.message.includes('429');
-                const isNetworkError = error.message.includes('NGHTTP2') || error.message.includes('socket') || 
-                                      error.message.includes('ECONNRESET') || error.message.includes('ETIMEDOUT') ||
-                                      error.message.includes('ENOTFOUND') || error.message.includes('EAI_AGAIN');
-                const isListPage = request.userData?.isListPage || /\/jobs\//.test(request.url);
-                
+            failedRequestHandler: async ({ request, session, error, log: crawlerLog }) => {
+                const message = error?.message || 'Unknown error';
+                const is403or429 = message.includes('403') || message.includes('429');
+                const isNetworkError = message.includes('NGHTTP2') || message.includes('socket') ||
+                                      message.includes('ECONNRESET') || message.includes('ETIMEDOUT') ||
+                                      message.includes('ENOTFOUND') || message.includes('EAI_AGAIN');
+                const isListPage = request.userData?.isListPage || LIST_PATH_REGEX.test(new URL(request.url).pathname);
+
                 if (is403or429) {
-                    log.warning(`🚫 Blocked (${error.message.includes('403') ? '403' : '429'}) on ${request.url} - retry ${request.retryCount}/4`);
-                    // Mark session as bad to force rotation
+                    crawlerLog.warning(`?? Blocked (${message.includes('403') ? '403' : '429'}) on ${request.url} - retry ${request.retryCount}/4`);
                     if (session) {
                         session.markBad();
                     }
-                    // Optimized backoff for blocking
                     await randomDelay(3000, 5000);
-                    
-                    // For list pages, try to re-enqueue with fresh session
+
                     if (isListPage && request.retryCount < 2) {
-                        log.info(`🔄 Re-enqueueing list page with fresh session`);
-                        // Will be retried automatically by crawler
+                        crawlerLog.info('?? Re-enqueueing list page with fresh session');
                     }
                 } else if (isNetworkError) {
-                    log.warning(`🌐 Network error on ${request.url}: ${error.message.substring(0, 100)}`);
-                    // Mark session as bad for connection errors
+                    crawlerLog.warning(`?? Network error on ${request.url}: ${message.substring(0, 100)}`);
                     if (session) {
                         session.markBad();
                     }
-                    // Optimized backoff for network issues
                     await randomDelay(2000, 4000);
                 } else {
-                    log.error(`❌ Failed ${request.url} after ${request.retryCount} retries: ${error.message.substring(0, 150)}`);
+                    crawlerLog.error(`? Failed ${request.url} after ${request.retryCount} retries: ${message.substring(0, 150)}`);
                 }
-                
-                // Mark as failed but DON'T add to failedUrls if it's a list page - we want to keep trying
+
                 if (!isListPage) {
                     failedUrls.add(request.url);
                 }
-                
-                log.info(`📊 Progress: ${saved}/${RESULTS_WANTED} jobs saved, ${pagesVisited}/${MAX_PAGES} pages visited`);
+
+                crawlerLog.info(`?? Progress: ${saved}/${RESULTS_WANTED} jobs saved, ${pagesVisited}/${MAX_PAGES} pages visited`);
             },
         });
 
-        await crawler.run(startRequests);
+        await crawler.run();
 
         // Final stats for QA and monitoring
         const stats = {
@@ -581,7 +613,8 @@ async function main() {
             pagesVisited: pagesVisited,
             targetJobs: RESULTS_WANTED,
             maxPages: MAX_PAGES,
-            uniqueUrlsSeen: seenUrls.size,
+            uniqueJobUrls: seenJobUrls.size,
+            uniquePageUrls: seenPageUrls.size,
             failedUrls: failedUrls.size,
         };
         
@@ -618,3 +651,4 @@ main()
     .finally(async () => {
         await Actor.exit();
     });
+
