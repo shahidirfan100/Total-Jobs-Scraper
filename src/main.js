@@ -221,10 +221,6 @@ async function main() {
             requestQueue,
             proxyConfiguration: proxyConf,
             maxRequestRetries: 4,
-            requestOptions: {
-                http2: false, // avoid NGHTTP2 issues from Totaljobs edge
-                timeout: { request: 45000 },
-            },
             useSessionPool: true,
             sessionPoolOptions: {
                 maxPoolSize: 100,
