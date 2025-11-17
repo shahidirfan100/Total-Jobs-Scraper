@@ -202,7 +202,7 @@ async function main() {
 
         await warmUpSite(proxyConf);
 
-        const requestQueue = await Actor.openRequestQueue('totaljobs');
+        const requestQueue = await Actor.openRequestQueue();
         await requestQueue.addRequests(startRequests);
 
         let saved = 0;
