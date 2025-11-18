@@ -10,9 +10,6 @@ import https from 'https';
 // CRITICAL: Disable HTTP/2 globally to prevent NGHTTP2 errors
 process.env.NODE_OPTIONS = (process.env.NODE_OPTIONS || '') + ' --no-deprecation --disable-http2';
 
-// CRITICAL: Disable HTTP/2 globally to prevent NGHTTP2 errors
-process.env.NODE_OPTIONS = (process.env.NODE_OPTIONS || '') + ' --no-deprecation --disable-http2';
-
 const JOB_PATH_REGEX = /\/job\/[^/?#]+\/[^/?#]+-job\d+/i;
 const JOB_DETAIL_REGEX = /^https?:\/\/(?:www\.)?totaljobs\.com\/job\/[^/?#]+\/[^/?#]+-job\d+/i;
 const LIST_PATH_REGEX = /\/jobs\//i;
@@ -343,25 +340,12 @@ async function main() {
                     // Inject fresh dynamic headers per request
                     injectDynamicHeaders(request);
                     
-                    // CRITICAL: Force HTTP/1.1 by setting request options
-                    request.agent = {
-                        http: new http.Agent({
-                            keepAlive: true,
-                            keepAliveMsecs: 30000,
-                            maxSockets: 50,
-                            maxFreeSockets: 10,
-                            timeout: 30000,
-                        }),
-                        https: new https.Agent({
-                            keepAlive: true,
-                            keepAliveMsecs: 30000,
-                            maxSockets: 50,
-                            maxFreeSockets: 10,
-                            timeout: 30000,
-                            rejectUnauthorized: false,
-                        }),
-                    };
-                    request.http2 = false;  // Explicitly disable HTTP/2
+                    // NOTE: Do NOT assign `agent` or other custom properties directly on `request`.
+                    // RequestQueue persists the request object and it must conform to the API schema.
+                    // Adding arbitrary properties such as `agent` causes RequestQueueClient.updateRequest
+                    // to fail with schema-validation errors. Instead, we keep HTTP/1.1 enforcement
+                    // at the global got-scraping level with the warm-up and by using per-crawler settings
+                    // that don't mutate the request object.
                     
                     const retryCount = request.retryCount || 0;
                     const isListPage = request.userData?.isListPage;
