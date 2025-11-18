@@ -326,7 +326,7 @@ async function main() {
             persistCookiesPerSession: true,
             additionalMimeTypes: ['application/json'],
             // CRITICAL: Force HTTP/1.1 at got-scraping level to prevent HTTP/2 errors
-            requestOptions: {
+            requestHandlerOptions: {
                 agent: {
                     http: httpAgent,
                     https: httpsAgent,
