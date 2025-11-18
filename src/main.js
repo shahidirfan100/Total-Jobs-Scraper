@@ -274,6 +274,7 @@ async function main() {
 
             async requestHandler({ request, $, session, log: crawlerLog }) {
                 // Inject dynamic headers for this request
+                request.noHttp2 = true;
                 injectDynamicHeaders(request);
 
                 const loadedUrl = request.loadedUrl || request.url;
@@ -625,8 +626,28 @@ if (isListPage) {
 
                 if (!isListPage) {
                     failedUrls.add(request.url);
+                    if (request.userData?.seed && saved < RESULTS_WANTED) {
+                        const seed = request.userData.seed;
+                        const fallbackRecord = {
+                            title: seed.title || null,
+                            company: seed.company || null,
+                            location: seed.location || null,
+                            salary: seed.salary || null,
+                            date_posted: seed.date_posted || null,
+                            job_type: null,
+                            job_category: null,
+                            description_html: seed.description_html || null,
+                            description_text: seed.description_text || null,
+                            job_url: request.loadedUrl || request.url,
+                        };
+                        if (fallbackRecord.title && fallbackRecord.job_url) {
+                            await Dataset.pushData(fallbackRecord);
+                            saved++;
+                            crawlerLog.info(`📄 Saved fallback seed for failed detail: ${fallbackRecord.title}`);
+                        }
+                    }
                 }
-
+                
                 crawlerLog.info(`?? Progress: ${saved}/${RESULTS_WANTED} jobs saved, ${pagesVisited}/${MAX_PAGES} pages visited`);
             },
         });
