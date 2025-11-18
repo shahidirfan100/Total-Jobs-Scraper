@@ -139,19 +139,41 @@ let warmupCookieHeader = '';
 const injectDynamicHeaders = (options) => {
   options.headers = options.headers || {};
   const dynamicHeaders = headerGenerator.getHeaders();
+  
+  // Preserve existing referer if set
+  const existingReferer = options.headers.referer || options.headers.Referer;
+  
   if (warmupCookieHeader) {
     dynamicHeaders.cookie = warmupCookieHeader;
   }
+  
   options.headers = {
     ...dynamicHeaders,
     ...options.headers,
   };
+  
+  // Restore referer if it was overwritten
+  if (existingReferer) {
+    options.headers['referer'] = existingReferer;
+  }
+  
+  // Enhanced stealth headers
+  options.headers['accept'] ??= 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8';
   options.headers['accept-language'] ??= 'en-GB,en-US;q=0.9,en;q=0.8';
-  options.headers['cache-control'] ??= 'no-cache';
-  options.headers['pragma'] ??= 'no-cache';
-  options.headers['sec-fetch-site'] ??= 'same-origin';
+  options.headers['accept-encoding'] ??= 'gzip, deflate, br';
+  options.headers['cache-control'] ??= 'max-age=0';
+  options.headers['sec-ch-ua'] ??= '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"';
+  options.headers['sec-ch-ua-mobile'] ??= '?0';
+  options.headers['sec-ch-ua-platform'] ??= '"Windows"';
+  options.headers['sec-fetch-dest'] ??= 'document';
   options.headers['sec-fetch-mode'] ??= 'navigate';
+  options.headers['sec-fetch-site'] ??= existingReferer ? 'same-origin' : 'none';
   options.headers['sec-fetch-user'] ??= '?1';
+  options.headers['upgrade-insecure-requests'] ??= '1';
+  
+  // Remove headers that might expose automation
+  delete options.headers['x-crawlee'];
+  delete options.headers['X-Crawlee'];
 };
 
 async function warmUpSite(proxyConf) {
@@ -245,6 +267,7 @@ async function main() {
         const seenJobUrls = new Set();
         const seenPageUrls = new Set(startRequests.map((req) => req.url));
         const failedUrls = new Set();
+        let shouldAbort = false;
 
         // Determine optimal concurrency based on user input or defaults
         const maxConcurrency = Number.isFinite(+input.maxConcurrency)
@@ -260,8 +283,8 @@ async function main() {
             sessionPoolOptions: {
                 maxPoolSize: 100,
                 sessionOptions: {
-                    maxUsageCount: 15,
-                    maxErrorScore: 2,
+                    maxUsageCount: 20,
+                    maxErrorScore: 3,
                 },
             },
             maxConcurrency: maxConcurrency,
@@ -273,21 +296,45 @@ async function main() {
             persistCookiesPerSession: true,
             additionalMimeTypes: ['application/json'],
             preNavigationHooks: [
-                async ({ request, session }) => {
+                async ({ request, session, crawler: crawlerInstance }) => {
+                    // Abort if target reached
+                    if (shouldAbort || saved >= RESULTS_WANTED) {
+                        log.info(`Aborting request - target reached: ${request.url}`);
+                        shouldAbort = true;
+                        return;
+                    }
+                    
+                    // Inject fresh dynamic headers per request
+                    injectDynamicHeaders(request);
+                    
                     const retryCount = request.retryCount || 0;
+                    const isListPage = request.userData?.isListPage;
+                    
+                    // More aggressive delays for list pages (anti-bot detection)
                     const delayBase = retryCount > 0
                         ? getBackoffDelay(retryCount)
-                        : Math.floor(Math.random() * 500) + 600;
-                    await randomDelay(delayBase, delayBase + 800);
+                        : isListPage 
+                            ? Math.floor(Math.random() * 800) + 1200  // 1200-2000ms for list pages
+                            : Math.floor(Math.random() * 400) + 700;  // 700-1100ms for detail pages
+                    
+                    await randomDelay(delayBase, delayBase + 600);
+                    
                     if (session && retryCount > 2) {
                         session.markBad();
                     }
                 },
             ],
+            // Force HTTP/1.1 to avoid HTTP/2 NGHTTP2_INTERNAL_ERROR
+            requestHandlerOptions: {
+                http2: false,
+            },
 
-            async requestHandler({ request, $, session, log: crawlerLog }) {
-                // Inject dynamic headers for this request
-                injectDynamicHeaders(request);
+            async requestHandler({ request, $, session, log: crawlerLog, crawler: crawlerInstance }) {
+                // Early abort check
+                if (shouldAbort || saved >= RESULTS_WANTED) {
+                    crawlerLog.info(`Skipping request - target reached (${saved}/${RESULTS_WANTED})`);
+                    return;
+                }
 
                 const loadedUrl = request.loadedUrl || request.url;
                 const urlObj = new URL(loadedUrl);
@@ -301,10 +348,12 @@ async function main() {
 // LIST PAGE: extract job links and pagination
 if (isListPage) {
     pagesVisited++;
-    crawlerLog.info(`?? Processing list page ${pagesVisited}/${MAX_PAGES}: ${request.url}`);
+    crawlerLog.info(`📃 Processing list page ${pagesVisited}/${MAX_PAGES}: ${request.url}`);
 
     if (saved >= RESULTS_WANTED) {
-        crawlerLog.info(`? Reached target of ${RESULTS_WANTED} jobs, stopping pagination`);
+        crawlerLog.info(`✅ Reached target of ${RESULTS_WANTED} jobs, stopping crawler`);
+        shouldAbort = true;
+        await crawlerInstance.autoscaledPool?.abort();
         return;
     }
 
@@ -312,8 +361,6 @@ if (isListPage) {
         crawlerLog.info(`Reached max pages limit (${MAX_PAGES})`);
         return;
     }
-
-    await randomDelay(400, 900);
 
                     const state = extractResultListState($);
                     const pagination = state?.searchResults?.pagination;
@@ -429,8 +476,11 @@ if (isListPage) {
     }
 
     if (collectDetails && jobLinks.length > 0) {
-        const toEnqueue = jobLinks.slice(0, RESULTS_WANTED - saved);
-        if (toEnqueue.length > 0) {
+        // Only enqueue if we haven't reached target
+        const remaining = Math.max(0, RESULTS_WANTED - saved);
+        const toEnqueue = jobLinks.slice(0, remaining);
+        
+        if (toEnqueue.length > 0 && !shouldAbort) {
             const prepared = toEnqueue.map((job) => ({
                 url: job.url,
                 uniqueKey: job.url,
@@ -440,13 +490,22 @@ if (isListPage) {
                 },
                 headers: {
                     referer: request.url,
+                    'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
                 },
             }));
+            
+            // Inject dynamic headers for each request
+            prepared.forEach(req => injectDynamicHeaders(req));
+            
             await requestQueue.addRequests(prepared);
-            crawlerLog.info(`Enqueued ${prepared.length} job detail pages`);
+            crawlerLog.info(`✓ Enqueued ${prepared.length} job detail pages (${saved}/${RESULTS_WANTED} saved)`);
+        } else if (remaining <= 0) {
+            crawlerLog.info(`Target reached, not enqueueing more detail pages`);
+            shouldAbort = true;
         }
     } else if (!collectDetails && jobLinks.length > 0) {
-        const toPush = jobLinks.slice(0, RESULTS_WANTED - saved).map(j => ({
+        const remaining = Math.max(0, RESULTS_WANTED - saved);
+        const toPush = jobLinks.slice(0, remaining).map(j => ({
             title: j.userData.seed.title,
             company: j.userData.seed.company,
             location: j.userData.seed.location,
@@ -458,12 +517,20 @@ if (isListPage) {
             description_html: j.userData.seed.description_html || null,
             description_text: j.userData.seed.description_text || null,
         }));
-        await Dataset.pushData(toPush);
-        saved += toPush.length;
-        crawlerLog.info(`Saved ${toPush.length} jobs (total: ${saved})`);
+        
+        if (toPush.length > 0) {
+            await Dataset.pushData(toPush);
+            saved += toPush.length;
+            crawlerLog.info(`📄 Saved ${toPush.length} jobs (total: ${saved}/${RESULTS_WANTED})`);
+            
+            if (saved >= RESULTS_WANTED) {
+                shouldAbort = true;
+                crawlerLog.info(`✅ Target reached, stopping crawler`);
+            }
+        }
     }
 
-                if (saved < RESULTS_WANTED && pagesVisited < MAX_PAGES) {
+                if (saved < RESULTS_WANTED && pagesVisited < MAX_PAGES && !shouldAbort) {
                     if (!nextPageUrl) {
                         const nextButton = $('a:contains("Next")').first();
                         if (nextButton.length && nextButton.attr('href')) {
@@ -499,11 +566,11 @@ if (isListPage) {
                             const manualNext = currentPage + 1;
                             nextPageUrl = buildPageUrl(request.url, manualNext);
                             nextPageNum = manualNext;
-                            crawlerLog.info(`?? Constructed next page URL: ${nextPageUrl}`);
+                            crawlerLog.info(`🔧 Constructed next page URL: ${nextPageUrl}`);
                         }
                     }
 
-                    if (nextPageUrl) {
+                    if (nextPageUrl && !shouldAbort) {
                         const normalizedNext = nextPageUrl.startsWith('http')
                             ? nextPageUrl
                             : `https://www.totaljobs.com${nextPageUrl.startsWith('/') ? nextPageUrl : `/${nextPageUrl}`}`;
@@ -515,36 +582,49 @@ if (isListPage) {
                         if (safePageNum > currentPage && safePageNum <= MAX_PAGES) {
                             if (!seenPageUrls.has(normalizedNext)) {
                                 seenPageUrls.add(normalizedNext);
-                                await requestQueue.addRequest({
+                                
+                                const nextPageReq = {
                                     url: normalizedNext,
                                     uniqueKey: normalizedNext,
-                                    userData: { referer: request.url, isListPage: true, pageNum: safePageNum },
-                                    headers: { referer: request.url },
-                                });
-                                crawlerLog.info(`? Enqueued next page ${safePageNum}/${MAX_PAGES} (${saved}/${RESULTS_WANTED} jobs saved)`);
+                                    userData: { 
+                                        referer: request.url, 
+                                        isListPage: true, 
+                                        pageNum: safePageNum 
+                                    },
+                                    headers: { 
+                                        referer: request.url,
+                                        'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
+                                    },
+                                };
+                                
+                                // Inject dynamic headers for pagination request
+                                injectDynamicHeaders(nextPageReq);
+                                
+                                await requestQueue.addRequest(nextPageReq);
+                                crawlerLog.info(`➡️ Enqueued next page ${safePageNum}/${MAX_PAGES} (${saved}/${RESULTS_WANTED} jobs saved)`);
                             } else {
-                                crawlerLog.debug(`?? Page already queued: ${normalizedNext}`);
+                                crawlerLog.debug(`⚠️ Page already queued: ${normalizedNext}`);
                             }
                         } else {
-                            crawlerLog.info(`?? Page ${safePageNum} exceeds limits (max: ${MAX_PAGES})`);
+                            crawlerLog.info(`⚠️ Page ${safePageNum} exceeds limits (max: ${MAX_PAGES})`);
                         }
+                    } else if (shouldAbort) {
+                        crawlerLog.info(`✅ Target reached, not enqueueing more pages`);
                     } else {
-                        crawlerLog.warning('?? Could not determine next page URL');
+                        crawlerLog.warning('⚠️ Could not determine next page URL');
                     }
                 } else if (saved >= RESULTS_WANTED) {
-                    crawlerLog.info(`?? Target reached (${saved}/${RESULTS_WANTED} jobs), stopping pagination`);
+                    crawlerLog.info(`✅ Target reached (${saved}/${RESULTS_WANTED} jobs), stopping pagination`);
+                    shouldAbort = true;
                 }
             }
 
             // DETAIL PAGE: extract full job details
                 if (isDetailPage) {
-                    if (saved >= RESULTS_WANTED) {
+                    if (saved >= RESULTS_WANTED || shouldAbort) {
                         crawlerLog.debug('Reached results limit, skipping detail page');
                         return;
                     }
-
-                    // Optimized delay for detail pages - balanced speed and stealth
-                    await randomDelay(500, 1200);
 
                     const seed = request.userData?.seed || {};
 
@@ -619,68 +699,117 @@ if (isListPage) {
                     };
 
                     // Validate: must have at least title and URL
-                    if (record.title && record.job_url) {
+                    if (record.title && record.job_url && saved < RESULTS_WANTED) {
                         await Dataset.pushData(record);
                         saved++;
-                        crawlerLog.info(`✓ Saved job #${saved}: ${record.title}`);
-                    } else {
+                        crawlerLog.info(`✓ Saved job #${saved}/${RESULTS_WANTED}: ${record.title}`);
+                        
+                        // Check if we reached target
+                        if (saved >= RESULTS_WANTED) {
+                            shouldAbort = true;
+                            crawlerLog.info(`✅ Target of ${RESULTS_WANTED} jobs reached, signaling abort`);
+                            await crawlerInstance.autoscaledPool?.abort();
+                        }
+                    } else if (!record.title || !record.job_url) {
                         crawlerLog.warning(`Skipped incomplete job: ${request.url}`);
+                    } else {
+                        crawlerLog.info(`Target already reached, skipping save`);
                     }
                 }
             },
 
             // Error handling with smart retry - DON'T STOP CRAWLING
             failedRequestHandler: async ({ request, session, error, log: crawlerLog }) => {
+                // Don't process failures if target already reached
+                if (shouldAbort || saved >= RESULTS_WANTED) {
+                    crawlerLog.info(`Target reached, skipping failed request handling`);
+                    return;
+                }
+                
                 const message = error?.message || 'Unknown error';
                 const is403or429 = message.includes('403') || message.includes('429');
                 const isNetworkError = message.includes('NGHTTP2') || message.includes('socket') ||
                                       message.includes('ECONNRESET') || message.includes('ETIMEDOUT') ||
-                                      message.includes('ENOTFOUND') || message.includes('EAI_AGAIN');
+                                      message.includes('ENOTFOUND') || message.includes('EAI_AGAIN') ||
+                                      message.includes('Stream closed');
                 const isListPage = request.userData?.isListPage || LIST_PATH_REGEX.test(new URL(request.url).pathname);
 
                 if (is403or429) {
-                    crawlerLog.warning(`?? Blocked (${message.includes('403') ? '403' : '429'}) on ${request.url} - retry ${request.retryCount}/4`);
+                    crawlerLog.warning(`🚫 Blocked (${message.includes('403') ? '403' : '429'}) on ${request.url} - retry ${request.retryCount}/4`);
                     if (session) {
-                        session.markBad();
+                        session.retire();
                     }
-                    await randomDelay(3000, 5000);
+                    await randomDelay(4000, 7000);
 
-                    if (isListPage && request.retryCount < 2) {
-                        crawlerLog.info('?? Re-enqueueing list page with fresh session');
+                    // For list pages, try to recover with fresh session and longer delay
+                    if (isListPage && request.retryCount >= 3 && !shouldAbort) {
+                        const pageNum = request.userData?.pageNum || 1;
+                        const fallbackUrl = buildPageUrl(request.url, pageNum);
+                        const uniqueRetryKey = `${fallbackUrl}#recovery-${Date.now()}`;
+                        
+                        if (!seenPageUrls.has(uniqueRetryKey)) {
+                            seenPageUrls.add(uniqueRetryKey);
+                            const recoveryReq = {
+                                url: fallbackUrl,
+                                uniqueKey: uniqueRetryKey,
+                                userData: {
+                                    referer: 'https://www.totaljobs.com/',
+                                    isListPage: true,
+                                    pageNum: pageNum,
+                                },
+                                headers: {
+                                    referer: 'https://www.totaljobs.com/',
+                                    'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
+                                },
+                            };
+                            injectDynamicHeaders(recoveryReq);
+                            await requestQueue.addRequest(recoveryReq);
+                            crawlerLog.info(`🔄 Recovery: Re-enqueued list page ${pageNum} with fresh session`);
+                        }
                     }
                 } else if (isNetworkError) {
-                    crawlerLog.warning(`?? Network error on ${request.url}: ${message.substring(0, 100)}`);
+                    crawlerLog.warning(`🌐 Network error on ${request.url}: ${message.substring(0, 100)}`);
                     if (session) {
-                        session.markBad();
+                        session.retire();
                     }
-                    await randomDelay(2000, 4000);
-                    if (isListPage) {
+                    await randomDelay(3000, 5000);
+                    
+                    // Retry list pages with manual URL construction
+                    if (isListPage && !shouldAbort) {
                         const fallbackPageNum = request.userData?.pageNum
                             || (request.url.includes('page=')
                                 ? Number(new URL(request.url).searchParams.get('page'))
                                 : null)
                             || 1;
                         const manualUrl = buildPageUrl(request.url, fallbackPageNum);
-                        if (!seenPageUrls.has(manualUrl)) {
-                            seenPageUrls.add(manualUrl);
-                            await requestQueue.addRequest({
+                        const retryKey = `${manualUrl}#network-retry-${request.retryCount}`;
+                        
+                        if (!seenPageUrls.has(retryKey) && request.retryCount >= 3) {
+                            seenPageUrls.add(retryKey);
+                            const retryReq = {
                                 url: manualUrl,
-                                uniqueKey: `${manualUrl}#retry`,
+                                uniqueKey: retryKey,
                                 userData: {
-                                    referer: request.userData?.referer || request.url,
+                                    referer: request.userData?.referer || 'https://www.totaljobs.com/',
                                     isListPage: true,
                                     pageNum: fallbackPageNum,
                                 },
-                                headers: { referer: request.userData?.referer || request.url },
-                            });
-                            crawlerLog.info(`?? Re-enqueued list page ${fallbackPageNum} via manual URL after network error`);
+                                headers: { 
+                                    referer: request.userData?.referer || 'https://www.totaljobs.com/',
+                                    'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
+                                },
+                            };
+                            injectDynamicHeaders(retryReq);
+                            await requestQueue.addRequest(retryReq);
+                            crawlerLog.info(`🔄 Re-enqueued list page ${fallbackPageNum} after network error`);
                         }
                     }
                 } else {
-                    crawlerLog.error(`? Failed ${request.url} after ${request.retryCount} retries: ${message.substring(0, 150)}`);
+                    crawlerLog.error(`❌ Failed ${request.url} after ${request.retryCount} retries: ${message.substring(0, 150)}`);
                 }
 
-                if (!isListPage) {
+                // Save seed data as fallback for failed detail pages
+                if (!isListPage && !shouldAbort) {
                     failedUrls.add(request.url);
                     if (request.userData?.seed && saved < RESULTS_WANTED) {
                         const seed = request.userData.seed;
@@ -699,12 +828,17 @@ if (isListPage) {
                         if (fallbackRecord.title && fallbackRecord.job_url) {
                             await Dataset.pushData(fallbackRecord);
                             saved++;
-                            crawlerLog.info(`📄 Saved fallback seed for failed detail: ${fallbackRecord.title}`);
+                            crawlerLog.info(`📄 Saved fallback seed #${saved}: ${fallbackRecord.title}`);
+                            
+                            if (saved >= RESULTS_WANTED) {
+                                shouldAbort = true;
+                                crawlerLog.info(`✅ Target reached via fallback data`);
+                            }
                         }
                     }
                 }
                 
-                crawlerLog.info(`?? Progress: ${saved}/${RESULTS_WANTED} jobs saved, ${pagesVisited}/${MAX_PAGES} pages visited`);
+                crawlerLog.info(`📊 Progress: ${saved}/${RESULTS_WANTED} jobs saved, ${pagesVisited}/${MAX_PAGES} pages visited`);
             },
         });
 
