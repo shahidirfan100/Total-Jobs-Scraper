@@ -98,6 +98,19 @@ function htmlToText(html) {
   return cheerioLoad(`<body>${html}</body>`).text().replace(/\s+/g, ' ').trim();
 }
 
+function buildPageUrl(currentUrl, targetPage) {
+  const urlObj = new URL(currentUrl);
+  urlObj.searchParams.delete('of');
+  urlObj.searchParams.delete('Of');
+  urlObj.searchParams.delete('action');
+  if (targetPage <= 1) {
+    urlObj.searchParams.delete('page');
+  } else {
+    urlObj.searchParams.set('page', targetPage.toString());
+  }
+  return urlObj.href;
+}
+
 // Utility: random delay for human-like browsing (stealth)
 function randomDelay(min, max) {
   const ms = Math.floor(Math.random() * (max - min + 1)) + min;
@@ -207,7 +220,7 @@ async function main() {
         const startRequests = initial.map((currentUrl) => {
             const request = {
                 url: currentUrl,
-                userData: { referer: 'https://www.totaljobs.com/', isListPage: true },
+                userData: { referer: 'https://www.totaljobs.com/', isListPage: true, pageNum: 1 },
                 headers: {
                     referer: 'https://www.totaljobs.com/',
                     'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
@@ -302,9 +315,30 @@ if (isListPage) {
 
     await randomDelay(400, 900);
 
-    const state = extractResultListState($);
-    let jobLinks = [];
-    let nextPageUrl = null;
+                    const state = extractResultListState($);
+                    const pagination = state?.searchResults?.pagination;
+                    const perPage = pagination?.perPage || 25;
+                    const derivedFromUrl = (() => {
+                        if (urlObj.searchParams.has('page')) {
+                            const val = Number(urlObj.searchParams.get('page'));
+                            return Number.isFinite(val) ? val : null;
+                        }
+                        if (urlObj.searchParams.has('of')) {
+                            const ofVal = Number(urlObj.searchParams.get('of'));
+                            if (Number.isFinite(ofVal)) {
+                                return Math.floor(ofVal / perPage) + 1;
+                            }
+                        }
+                        return null;
+                    })();
+                    let currentPage = request.userData?.pageNum
+                        || pagination?.page
+                        || derivedFromUrl
+                        || 1;
+
+                    let jobLinks = [];
+                    let nextPageUrl = null;
+                    let nextPageNum = null;
 
     if (state?.searchResults?.items?.length) {
         const items = state.searchResults.items;
@@ -335,8 +369,12 @@ if (isListPage) {
                 },
             });
         }
-        nextPageUrl = state.searchResults.pagination?.links?.next || null;
-        crawlerLog.debug(`State payload provided ${jobLinks.length} jobs`);
+                        nextPageUrl = state.searchResults.pagination?.links?.next || null;
+                        crawlerLog.debug(`State payload provided ${jobLinks.length} jobs`);
+                        if (pagination?.pageCount && pagination.page < pagination.pageCount) {
+                            nextPageNum = pagination.page + 1;
+                            nextPageUrl = buildPageUrl(request.url, nextPageNum);
+                        }
     }
 
     if (!jobLinks.length) {
@@ -425,83 +463,80 @@ if (isListPage) {
         crawlerLog.info(`Saved ${toPush.length} jobs (total: ${saved})`);
     }
 
-    if (saved < RESULTS_WANTED && pagesVisited < MAX_PAGES) {
-        const currentUrlObj = new URL(request.url);
-        const currentPage = currentUrlObj.searchParams.has('page')
-            ? Number(currentUrlObj.searchParams.get('page'))
-            : 1;
+                if (saved < RESULTS_WANTED && pagesVisited < MAX_PAGES) {
+                    if (!nextPageUrl) {
+                        const nextButton = $('a:contains("Next")').first();
+                        if (nextButton.length && nextButton.attr('href')) {
+                            const nextHref = nextButton.attr('href');
+                            nextPageUrl = nextHref.startsWith('http') 
+                                ? nextHref 
+                                : `https://www.totaljobs.com${nextHref.startsWith('/') ? nextHref : '/' + nextHref}`;
+                            nextPageNum = currentPage + 1;
+                            crawlerLog.info(`Found Next button: ${nextPageUrl}`);
+                        }
 
-        if (!nextPageUrl) {
-            const nextButton = $('a:contains("Next")').first();
-            if (nextButton.length && nextButton.attr('href')) {
-                const nextHref = nextButton.attr('href');
-                nextPageUrl = nextHref.startsWith('http') 
-                    ? nextHref 
-                    : `https://www.totaljobs.com${nextHref.startsWith('/') ? nextHref : '/' + nextHref}`;
-                crawlerLog.info(`Found Next button: ${nextPageUrl}`);
-            }
+                        if (!nextPageUrl) {
+                            const pageLinks = $('a[href*="page="]');
+                            pageLinks.each((i, el) => {
+                                const href = $(el).attr('href');
+                                if (href) {
+                                    const match = href.match(/page=(\d+)/);
+                                    if (match) {
+                                        const pageNumCandidate = Number(match[1]);
+                                        if (pageNumCandidate === currentPage + 1) {
+                                            nextPageUrl = href.startsWith('http') 
+                                                ? href 
+                                                : `https://www.totaljobs.com${href.startsWith('/') ? href : '/' + href}`;
+                                            nextPageNum = pageNumCandidate;
+                                            return false;
+                                        }
+                                    }
+                                }
+                            });
+                        }
 
-            if (!nextPageUrl) {
-                const pageLinks = $('a[href*="page="]');
-                pageLinks.each((i, el) => {
-                    const href = $(el).attr('href');
-                    if (href) {
-                        const match = href.match(/page=(\d+)/);
-                        if (match) {
-                            const pageNum = Number(match[1]);
-                            if (pageNum === currentPage + 1) {
-                                nextPageUrl = href.startsWith('http') 
-                                    ? href 
-                                    : `https://www.totaljobs.com${href.startsWith('/') ? href : '/' + href}`;
-                                return false;
-                            }
+                        if (!nextPageUrl) {
+                            const manualNext = currentPage + 1;
+                            nextPageUrl = buildPageUrl(request.url, manualNext);
+                            nextPageNum = manualNext;
+                            crawlerLog.info(`?? Constructed next page URL: ${nextPageUrl}`);
                         }
                     }
-                });
-            }
 
-            if (!nextPageUrl) {
-                const nextPageNum = currentPage + 1;
-                const nextUrlObj = new URL(request.url);
-                nextUrlObj.searchParams.set('page', nextPageNum.toString());
-                nextPageUrl = nextUrlObj.href;
-                crawlerLog.info(`?? Constructed next page URL: ${nextPageUrl}`);
-            }
-        }
+                    if (nextPageUrl) {
+                        const normalizedNext = nextPageUrl.startsWith('http')
+                            ? nextPageUrl
+                            : `https://www.totaljobs.com${nextPageUrl.startsWith('/') ? nextPageUrl : `/${nextPageUrl}`}`;
+                        const derivedNextNum = normalizedNext.includes('page=')
+                            ? Number(new URL(normalizedNext).searchParams.get('page'))
+                            : (nextPageNum ?? (currentPage + 1));
+                        const safePageNum = Number.isFinite(derivedNextNum) ? derivedNextNum : currentPage + 1;
 
-        if (nextPageUrl) {
-            const normalizedNext = nextPageUrl.startsWith('http')
-                ? nextPageUrl
-                : `https://www.totaljobs.com${nextPageUrl.startsWith('/') ? nextPageUrl : `/${nextPageUrl}`}`;
-            const nextUrlObj = new URL(normalizedNext);
-            const nextPageNum = nextUrlObj.searchParams.has('page') 
-                ? Number(nextUrlObj.searchParams.get('page')) 
-                : currentPage + 1;
-
-            if (nextPageNum > currentPage && nextPageNum <= MAX_PAGES) {
-                if (!seenPageUrls.has(normalizedNext)) {
-                    seenPageUrls.add(normalizedNext);
-                    await requestQueue.addRequest({
-                        url: normalizedNext,
-                        uniqueKey: normalizedNext,
-                        userData: { referer: request.url, isListPage: true },
-                        headers: { referer: request.url },
-                    });
-                    crawlerLog.info(`? Enqueued next page ${nextPageNum}/${MAX_PAGES} (${saved}/${RESULTS_WANTED} jobs saved)`);
-                } else {
-                    crawlerLog.debug(`?? Page already queued: ${normalizedNext}`);
+                        if (safePageNum > currentPage && safePageNum <= MAX_PAGES) {
+                            if (!seenPageUrls.has(normalizedNext)) {
+                                seenPageUrls.add(normalizedNext);
+                                await requestQueue.addRequest({
+                                    url: normalizedNext,
+                                    uniqueKey: normalizedNext,
+                                    userData: { referer: request.url, isListPage: true, pageNum: safePageNum },
+                                    headers: { referer: request.url },
+                                });
+                                crawlerLog.info(`? Enqueued next page ${safePageNum}/${MAX_PAGES} (${saved}/${RESULTS_WANTED} jobs saved)`);
+                            } else {
+                                crawlerLog.debug(`?? Page already queued: ${normalizedNext}`);
+                            }
+                        } else {
+                            crawlerLog.info(`?? Page ${safePageNum} exceeds limits (max: ${MAX_PAGES})`);
+                        }
+                    } else {
+                        crawlerLog.warning('?? Could not determine next page URL');
+                    }
+                } else if (saved >= RESULTS_WANTED) {
+                    crawlerLog.info(`?? Target reached (${saved}/${RESULTS_WANTED} jobs), stopping pagination`);
                 }
-            } else {
-                crawlerLog.info(`?? Page ${nextPageNum} exceeds limits (max: ${MAX_PAGES})`);
             }
-        } else {
-            crawlerLog.warning('?? Could not determine next page URL');
-        }
-    } else if (saved >= RESULTS_WANTED) {
-        crawlerLog.info(`?? Target reached (${saved}/${RESULTS_WANTED} jobs), stopping pagination`);
-    }
-}
-                // DETAIL PAGE: extract full job details
+
+            // DETAIL PAGE: extract full job details
                 if (isDetailPage) {
                     if (saved >= RESULTS_WANTED) {
                         crawlerLog.debug('Reached results limit, skipping detail page');
@@ -619,6 +654,28 @@ if (isListPage) {
                         session.markBad();
                     }
                     await randomDelay(2000, 4000);
+                    if (isListPage) {
+                        const fallbackPageNum = request.userData?.pageNum
+                            || (request.url.includes('page=')
+                                ? Number(new URL(request.url).searchParams.get('page'))
+                                : null)
+                            || 1;
+                        const manualUrl = buildPageUrl(request.url, fallbackPageNum);
+                        if (!seenPageUrls.has(manualUrl)) {
+                            seenPageUrls.add(manualUrl);
+                            await requestQueue.addRequest({
+                                url: manualUrl,
+                                uniqueKey: `${manualUrl}#retry`,
+                                userData: {
+                                    referer: request.userData?.referer || request.url,
+                                    isListPage: true,
+                                    pageNum: fallbackPageNum,
+                                },
+                                headers: { referer: request.userData?.referer || request.url },
+                            });
+                            crawlerLog.info(`?? Re-enqueued list page ${fallbackPageNum} via manual URL after network error`);
+                        }
+                    }
                 } else {
                     crawlerLog.error(`? Failed ${request.url} after ${request.retryCount} retries: ${message.substring(0, 150)}`);
                 }
