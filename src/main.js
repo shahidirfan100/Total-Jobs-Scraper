@@ -76,6 +76,28 @@ function extractJsonLd($, url) {
   return null;
 }
 
+function extractResultListState($) {
+  const scripts = $('script');
+  for (let i = 0; i < scripts.length; i++) {
+    const content = $(scripts[i]).html();
+    if (!content) continue;
+    const match = content.match(/window\.__PRELOADED_STATE__\["app-unifiedResultlist"\]\s*=\s*(\{[\s\S]*?\});/);
+    if (match) {
+      try {
+        return JSON.parse(match[1]);
+      } catch (err) {
+        log.debug(`Result list state parse error: ${err.message}`);
+      }
+    }
+  }
+  return null;
+}
+
+function htmlToText(html) {
+  if (!html) return '';
+  return cheerioLoad(`<body>${html}</body>`).text().replace(/\s+/g, ' ').trim();
+}
+
 // Utility: random delay for human-like browsing (stealth)
 function randomDelay(min, max) {
   const ms = Math.floor(Math.random() * (max - min + 1)) + min;
@@ -214,7 +236,7 @@ async function main() {
         // Determine optimal concurrency based on user input or defaults
         const maxConcurrency = Number.isFinite(+input.maxConcurrency)
             ? Math.max(1, Math.min(12, +input.maxConcurrency))
-            : 6;
+            : 8;
         
         // Stealth best practices: optimized speed with maintained stealth
         const crawler = new CheerioCrawler({
@@ -233,7 +255,7 @@ async function main() {
             minConcurrency: Math.max(1, Math.floor(maxConcurrency / 2)),
             requestHandlerTimeoutSecs: 60,
             navigationTimeoutSecs: 45,
-            maxRequestsPerMinute: 150,
+            maxRequestsPerMinute: 220,
             ignoreSslErrors: true,
             persistCookiesPerSession: true,
             additionalMimeTypes: ['application/json'],
@@ -250,7 +272,7 @@ async function main() {
                 },
             ],
 
-            async requestHandler({ request, $, enqueueLinks, session, log: crawlerLog }) {
+            async requestHandler({ request, $, session, log: crawlerLog }) {
                 // Inject dynamic headers for this request
                 injectDynamicHeaders(request);
 
@@ -262,217 +284,223 @@ async function main() {
                 const isListPage = request.userData?.isListPage
                     || (LIST_PATH_REGEX.test(urlObj.pathname) && !isDetailPage);
 
-                // LIST PAGE: extract job links and pagination
-                if (isListPage) {
-                    pagesVisited++;
-                    crawlerLog.info(`📄 Processing list page ${pagesVisited}/${MAX_PAGES}: ${request.url}`);
-                    
-                    if (saved >= RESULTS_WANTED) {
-                        crawlerLog.info(`✅ Reached target of ${RESULTS_WANTED} jobs, stopping pagination`);
-                        return;
-                    }
-                    
-                    if (pagesVisited > MAX_PAGES) {
-                        crawlerLog.info(`Reached max pages limit (${MAX_PAGES})`);
-                        return;
-                    }
 
-                    // Optimized delay for list pages - balanced speed and stealth
-                    await randomDelay(800, 1500);
+// LIST PAGE: extract job links and pagination
+if (isListPage) {
+    pagesVisited++;
+    crawlerLog.info(`?? Processing list page ${pagesVisited}/${MAX_PAGES}: ${request.url}`);
 
-                    // Debug pagination elements
-                    const nextButtons = $('a:contains("Next")');
-                    const pageLinks = $('a[href*="?page="]');
-                    const allLinks = $('a[href*="page"]');
-                    crawlerLog.info(`Page ${pagesVisited}: Found ${nextButtons.length} Next buttons, ${pageLinks.length} page links, ${allLinks.length} total page-related links`);
-                    
-                    if (nextButtons.length > 0) {
-                        nextButtons.each((i, el) => {
-                            const href = $(el).attr('href');
-                            crawlerLog.debug(`Next button ${i}: href="${href}", text="${$(el).text().trim()}"`);
-                        });
-                    }
+    if (saved >= RESULTS_WANTED) {
+        crawlerLog.info(`? Reached target of ${RESULTS_WANTED} jobs, stopping pagination`);
+        return;
+    }
 
-                    // Find all job links: /job/[title]/[company]-job[id]
-                    const jobLinks = [];
-                    $('a[href^="/job/"]').each((i, el) => {
-                        const href = $(el).attr('href');
-                        if (href && href.match(/\/job\/[^/]+\/[^/]+-job\d+/)) {
-                            const fullUrl = `https://www.totaljobs.com${href}`;
-                            if (!seenJobUrls.has(fullUrl) && !failedUrls.has(fullUrl)) {
-                                seenJobUrls.add(fullUrl);
-                                
-                                // Extract basic info from listing (fallback if detail fails)
-                                const $link = $(el);
-                                const title = $link.text().trim() || null;
-                                
-                                // Find parent container for company/location/salary
-                                const $container = $link.closest('article, li, div').length 
-                                    ? $link.closest('article, li, div') 
-                                    : $link.parent();
-                                
-                                const company = pickText($container, [
-                                    'a[href*="/jobs/"]',
-                                    '.company',
-                                    'span:contains("Ltd")',
-                                ]) || null;
-                                
-                                const location = pickText($container, [
-                                    'span:contains(","), span:contains("London"), span:contains("Manchester")',
-                                    '.location',
-                                ]) || null;
-                                
-                                const salary = pickText($container, [
-                                    'span:contains("£"), span:contains("per")',
-                                    '.salary',
-                                ]) || null;
-                                
-                                const date_posted = pickText($container, [
-                                    'span:contains("ago"), span:contains("hours"), span:contains("days")',
-                                    '.posted',
-                                ]) || null;
+    if (pagesVisited > MAX_PAGES) {
+        crawlerLog.info(`Reached max pages limit (${MAX_PAGES})`);
+        return;
+    }
 
-                                jobLinks.push({
-                                    url: fullUrl,
-                                    userData: {
-                                        seed: { title, company, location, salary, date_posted },
-                                        referer: request.url,
-                                    },
-                                });
-                            }
-                        }
+    await randomDelay(400, 900);
+
+    const state = extractResultListState($);
+    let jobLinks = [];
+    let nextPageUrl = null;
+
+    if (state?.searchResults?.items?.length) {
+        const items = state.searchResults.items;
+        for (const item of items) {
+            const href = item.url;
+            if (!href) continue;
+            const fullUrl = href.startsWith('http')
+                ? href
+                : `https://www.totaljobs.com${href.startsWith('/') ? href : `/${href}`}`;
+            if (seenJobUrls.has(fullUrl) || failedUrls.has(fullUrl)) continue;
+            seenJobUrls.add(fullUrl);
+
+            const snippetHtml = item.textSnippet || '';
+            jobLinks.push({
+                url: fullUrl,
+                userData: {
+                    seed: {
+                        title: item.title || null,
+                        company: item.companyName || null,
+                        location: item.location || null,
+                        salary: item.salary || null,
+                        date_posted: item.datePosted || null,
+                        description_html: snippetHtml || null,
+                        description_text: htmlToText(snippetHtml) || null,
+                        job_id: item.id ? String(item.id) : null,
+                    },
+                    jobId: item.id,
+                },
+            });
+        }
+        nextPageUrl = state.searchResults.pagination?.links?.next || null;
+        crawlerLog.debug(`State payload provided ${jobLinks.length} jobs`);
+    }
+
+    if (!jobLinks.length) {
+        const fallbackLinks = [];
+        $('a[href^="/job/"]').each((i, el) => {
+            const href = $(el).attr('href');
+            if (href && href.match(/\/job\/[^/]+\/[^/]+-job\d+/)) {
+                const fullUrl = `https://www.totaljobs.com${href}`;
+                if (!seenJobUrls.has(fullUrl) && !failedUrls.has(fullUrl)) {
+                    seenJobUrls.add(fullUrl);
+
+                    const $link = $(el);
+                    const title = $link.text().trim() || null;
+                    const $container = $link.closest('article, li, div').length 
+                        ? $link.closest('article, li, div') 
+                        : $link.parent();
+
+                    const company = pickText($container, [
+                        'a[href*="/jobs/"]',
+                        '.company',
+                        'span:contains("Ltd")',
+                    ]) || null;
+
+                    const location = pickText($container, [
+                        'span:contains(","), span:contains("London"), span:contains("Manchester")',
+                        '.location',
+                    ]) || null;
+
+                    const salary = pickText($container, [
+                        'span:contains("£"), span:contains("per")',
+                        '.salary',
+                    ]) || null;
+
+                    const date_posted = pickText($container, [
+                        'span:contains("ago"), span:contains("hours"), span:contains("days")',
+                        '.posted',
+                    ]) || null;
+
+                    fallbackLinks.push({
+                        url: fullUrl,
+                        userData: {
+                            seed: { title, company, location, salary, date_posted },
+                        },
                     });
-
-                    crawlerLog.info(`Found ${jobLinks.length} unique job links on page ${pagesVisited}`);
-
-                    // Enqueue job detail pages
-                    if (collectDetails && jobLinks.length > 0) {
-                        const toEnqueue = jobLinks.slice(0, RESULTS_WANTED - saved);
-                        if (toEnqueue.length > 0) {
-                            await enqueueLinks({
-                                urls: toEnqueue.map(j => j.url),
-                                transformRequestFunction: (req) => {
-                                    const match = jobLinks.find(j => j.url === req.url);
-                                    if (match) {
-                                        req.userData = {
-                                            ...match.userData,
-                                            isDetailPage: true,
-                                        };
-                                    }
-                                    req.headers = req.headers || {};
-                                    req.headers.referer = request.url;
-                                    return req;
-                                },
-                            });
-                            crawlerLog.info(`Enqueued ${toEnqueue.length} job detail pages`);
-                        }
-                    } else if (!collectDetails && jobLinks.length > 0) {
-                        // Save minimal data from listing
-                        const toPush = jobLinks.slice(0, RESULTS_WANTED - saved).map(j => ({
-                            title: j.userData.seed.title,
-                            company: j.userData.seed.company,
-                            location: j.userData.seed.location,
-                            salary: j.userData.seed.salary,
-                            date_posted: j.userData.seed.date_posted,
-                            job_url: j.url,
-                            job_type: null,
-                            job_category: null,
-                            description_html: null,
-                            description_text: null,
-                        }));
-                        await Dataset.pushData(toPush);
-                        saved += toPush.length;
-                        crawlerLog.info(`Saved ${toPush.length} jobs (total: ${saved})`);
-                    }
-
-                    // Pagination: follow next page link - AGGRESSIVE APPROACH
-                    if (saved < RESULTS_WANTED && pagesVisited < MAX_PAGES) {
-                        const currentUrlObj = new URL(request.url);
-                        const currentPage = currentUrlObj.searchParams.has('page')
-                            ? Number(currentUrlObj.searchParams.get('page'))
-                            : 1;
-
-                        let nextPageUrl = null;
-
-                        // Method 1: Look for "Next" button with href
-                        const nextButton = $('a:contains("Next")').first();
-                        if (nextButton.length && nextButton.attr('href')) {
-                            const nextHref = nextButton.attr('href');
-                            nextPageUrl = nextHref.startsWith('http') 
-                                ? nextHref 
-                                : `https://www.totaljobs.com${nextHref.startsWith('/') ? nextHref : '/' + nextHref}`;
-                            crawlerLog.info(`Found Next button: ${nextPageUrl}`);
-                        }
-
-                        // Method 2: Look for numbered page links and find the next one
-                        if (!nextPageUrl) {
-                            const pageLinks = $('a[href*="page="]');
-                            pageLinks.each((i, el) => {
-                                const href = $(el).attr('href');
-                                if (href) {
-                                    const match = href.match(/page=(\d+)/);
-                                    if (match) {
-                                        const pageNum = Number(match[1]);
-                                        if (pageNum === currentPage + 1) {
-                                            nextPageUrl = href.startsWith('http') 
-                                                ? href 
-                                                : `https://www.totaljobs.com${href.startsWith('/') ? href : '/' + href}`;
-                                            return false; // break
-                                        }
-                                    }
-                                }
-                            });
-                            if (nextPageUrl) {
-                                crawlerLog.info(`Found page link for page ${currentPage + 1}: ${nextPageUrl}`);
-                            }
-                        }
-
-                        // Method 3: If no Next button or page link, construct next page URL manually
-                        if (!nextPageUrl) {
-                            const nextPageNum = currentPage + 1;
-                            const nextUrlObj = new URL(request.url);
-                            nextUrlObj.searchParams.set('page', nextPageNum.toString());
-                            nextPageUrl = nextUrlObj.href;
-                            crawlerLog.info(`🔧 Constructed next page URL: ${nextPageUrl}`);
-                        }
-
-                        // Always try to enqueue next page if we haven't reached limits
-                        if (nextPageUrl) {
-                            const nextUrlObj = new URL(nextPageUrl);
-                            const nextPageNum = nextUrlObj.searchParams.has('page') 
-                                ? Number(nextUrlObj.searchParams.get('page')) 
-                                : 2;
-                            
-                            // More lenient validation - trust the URL construction
-                            if (nextPageNum > currentPage && nextPageNum <= MAX_PAGES) {
-                                if (!seenPageUrls.has(nextPageUrl)) {
-                                    seenPageUrls.add(nextPageUrl);
-                                    await enqueueLinks({
-                                        urls: [nextPageUrl],
-                                        transformRequestFunction: (req) => {
-                                            req.userData = { referer: request.url, isListPage: true };
-                                            req.headers = req.headers || {};
-                                            req.headers.referer = request.url;
-                                            // Higher priority for pagination
-                                            req.retryCount = 0;
-                                            return req;
-                                        },
-                                    });
-                                    crawlerLog.info(`✅ Enqueued next page ${nextPageNum}/${MAX_PAGES} (${saved}/${RESULTS_WANTED} jobs saved)`);
-                                } else {
-                                    crawlerLog.debug(`⏭️ Page already queued: ${nextPageUrl}`);
-                                }
-                            } else {
-                                crawlerLog.info(`🛑 Page ${nextPageNum} exceeds limits (max: ${MAX_PAGES})`);
-                            }
-                        } else {
-                            crawlerLog.warning('⚠️ Could not determine next page URL');
-                        }
-                    } else if (saved >= RESULTS_WANTED) {
-                        crawlerLog.info(`🎯 Target reached (${saved}/${RESULTS_WANTED} jobs), stopping pagination`);
-                    }
                 }
+            }
+        });
+        jobLinks = fallbackLinks;
+        crawlerLog.info(`Fallback DOM extraction found ${jobLinks.length} jobs`);
+    } else {
+        crawlerLog.info(`Found ${jobLinks.length} jobs via embedded state`);
+    }
 
+    if (collectDetails && jobLinks.length > 0) {
+        const toEnqueue = jobLinks.slice(0, RESULTS_WANTED - saved);
+        if (toEnqueue.length > 0) {
+            const prepared = toEnqueue.map((job) => ({
+                url: job.url,
+                uniqueKey: job.url,
+                userData: {
+                    ...job.userData,
+                    isDetailPage: true,
+                },
+                headers: {
+                    referer: request.url,
+                },
+            }));
+            await requestQueue.addRequests(prepared);
+            crawlerLog.info(`Enqueued ${prepared.length} job detail pages`);
+        }
+    } else if (!collectDetails && jobLinks.length > 0) {
+        const toPush = jobLinks.slice(0, RESULTS_WANTED - saved).map(j => ({
+            title: j.userData.seed.title,
+            company: j.userData.seed.company,
+            location: j.userData.seed.location,
+            salary: j.userData.seed.salary,
+            date_posted: j.userData.seed.date_posted,
+            job_url: j.url,
+            job_type: null,
+            job_category: null,
+            description_html: j.userData.seed.description_html || null,
+            description_text: j.userData.seed.description_text || null,
+        }));
+        await Dataset.pushData(toPush);
+        saved += toPush.length;
+        crawlerLog.info(`Saved ${toPush.length} jobs (total: ${saved})`);
+    }
+
+    if (saved < RESULTS_WANTED && pagesVisited < MAX_PAGES) {
+        const currentUrlObj = new URL(request.url);
+        const currentPage = currentUrlObj.searchParams.has('page')
+            ? Number(currentUrlObj.searchParams.get('page'))
+            : 1;
+
+        if (!nextPageUrl) {
+            const nextButton = $('a:contains("Next")').first();
+            if (nextButton.length && nextButton.attr('href')) {
+                const nextHref = nextButton.attr('href');
+                nextPageUrl = nextHref.startsWith('http') 
+                    ? nextHref 
+                    : `https://www.totaljobs.com${nextHref.startsWith('/') ? nextHref : '/' + nextHref}`;
+                crawlerLog.info(`Found Next button: ${nextPageUrl}`);
+            }
+
+            if (!nextPageUrl) {
+                const pageLinks = $('a[href*="page="]');
+                pageLinks.each((i, el) => {
+                    const href = $(el).attr('href');
+                    if (href) {
+                        const match = href.match(/page=(\d+)/);
+                        if (match) {
+                            const pageNum = Number(match[1]);
+                            if (pageNum === currentPage + 1) {
+                                nextPageUrl = href.startsWith('http') 
+                                    ? href 
+                                    : `https://www.totaljobs.com${href.startsWith('/') ? href : '/' + href}`;
+                                return false;
+                            }
+                        }
+                    }
+                });
+            }
+
+            if (!nextPageUrl) {
+                const nextPageNum = currentPage + 1;
+                const nextUrlObj = new URL(request.url);
+                nextUrlObj.searchParams.set('page', nextPageNum.toString());
+                nextPageUrl = nextUrlObj.href;
+                crawlerLog.info(`?? Constructed next page URL: ${nextPageUrl}`);
+            }
+        }
+
+        if (nextPageUrl) {
+            const normalizedNext = nextPageUrl.startsWith('http')
+                ? nextPageUrl
+                : `https://www.totaljobs.com${nextPageUrl.startsWith('/') ? nextPageUrl : `/${nextPageUrl}`}`;
+            const nextUrlObj = new URL(normalizedNext);
+            const nextPageNum = nextUrlObj.searchParams.has('page') 
+                ? Number(nextUrlObj.searchParams.get('page')) 
+                : currentPage + 1;
+
+            if (nextPageNum > currentPage && nextPageNum <= MAX_PAGES) {
+                if (!seenPageUrls.has(normalizedNext)) {
+                    seenPageUrls.add(normalizedNext);
+                    await requestQueue.addRequest({
+                        url: normalizedNext,
+                        uniqueKey: normalizedNext,
+                        userData: { referer: request.url, isListPage: true },
+                        headers: { referer: request.url },
+                    });
+                    crawlerLog.info(`? Enqueued next page ${nextPageNum}/${MAX_PAGES} (${saved}/${RESULTS_WANTED} jobs saved)`);
+                } else {
+                    crawlerLog.debug(`?? Page already queued: ${normalizedNext}`);
+                }
+            } else {
+                crawlerLog.info(`?? Page ${nextPageNum} exceeds limits (max: ${MAX_PAGES})`);
+            }
+        } else {
+            crawlerLog.warning('?? Could not determine next page URL');
+        }
+    } else if (saved >= RESULTS_WANTED) {
+        crawlerLog.info(`?? Target reached (${saved}/${RESULTS_WANTED} jobs), stopping pagination`);
+    }
+}
                 // DETAIL PAGE: extract full job details
                 if (isDetailPage) {
                     if (saved >= RESULTS_WANTED) {
@@ -481,7 +509,7 @@ async function main() {
                     }
 
                     // Optimized delay for detail pages - balanced speed and stealth
-                    await randomDelay(1000, 2000);
+                    await randomDelay(500, 1200);
 
                     const seed = request.userData?.seed || {};
 
