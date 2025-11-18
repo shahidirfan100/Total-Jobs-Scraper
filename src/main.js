@@ -274,7 +274,6 @@ async function main() {
 
             async requestHandler({ request, $, session, log: crawlerLog }) {
                 // Inject dynamic headers for this request
-                request.noHttp2 = true;
                 injectDynamicHeaders(request);
 
                 const loadedUrl = request.loadedUrl || request.url;
