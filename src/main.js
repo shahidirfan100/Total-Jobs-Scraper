@@ -7,6 +7,12 @@ import { gotScraping } from 'got-scraping';
 import http from 'http';
 import https from 'https';
 
+// CRITICAL: Disable HTTP/2 globally to prevent NGHTTP2 errors
+process.env.NODE_OPTIONS = (process.env.NODE_OPTIONS || '') + ' --no-deprecation --disable-http2';
+
+// CRITICAL: Disable HTTP/2 globally to prevent NGHTTP2 errors
+process.env.NODE_OPTIONS = (process.env.NODE_OPTIONS || '') + ' --no-deprecation --disable-http2';
+
 const JOB_PATH_REGEX = /\/job\/[^/?#]+\/[^/?#]+-job\d+/i;
 const JOB_DETAIL_REGEX = /^https?:\/\/(?:www\.)?totaljobs\.com\/job\/[^/?#]+\/[^/?#]+-job\d+/i;
 const LIST_PATH_REGEX = /\/jobs\//i;
@@ -325,21 +331,6 @@ async function main() {
             ignoreSslErrors: true,
             persistCookiesPerSession: true,
             additionalMimeTypes: ['application/json'],
-            // CRITICAL: Force HTTP/1.1 at got-scraping level to prevent HTTP/2 errors
-            requestHandlerOptions: {
-                agent: {
-                    http: httpAgent,
-                    https: httpsAgent,
-                },
-                http2: false,  // Explicitly disable HTTP/2
-                timeout: {
-                    request: 30000,
-                    response: 30000,
-                },
-                retry: {
-                    limit: 0,  // Let Crawlee handle retries
-                },
-            },
             preNavigationHooks: [
                 async ({ request, session, crawler: crawlerInstance }) => {
                     // Abort if target reached
@@ -351,6 +342,26 @@ async function main() {
                     
                     // Inject fresh dynamic headers per request
                     injectDynamicHeaders(request);
+                    
+                    // CRITICAL: Force HTTP/1.1 by setting request options
+                    request.agent = {
+                        http: new http.Agent({
+                            keepAlive: true,
+                            keepAliveMsecs: 30000,
+                            maxSockets: 50,
+                            maxFreeSockets: 10,
+                            timeout: 30000,
+                        }),
+                        https: new https.Agent({
+                            keepAlive: true,
+                            keepAliveMsecs: 30000,
+                            maxSockets: 50,
+                            maxFreeSockets: 10,
+                            timeout: 30000,
+                            rejectUnauthorized: false,
+                        }),
+                    };
+                    request.http2 = false;  // Explicitly disable HTTP/2
                     
                     const retryCount = request.retryCount || 0;
                     const isListPage = request.userData?.isListPage;
