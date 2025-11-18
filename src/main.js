@@ -4,6 +4,8 @@ import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 import { HeaderGenerator } from 'header-generator';
 import { gotScraping } from 'got-scraping';
+import http from 'http';
+import https from 'https';
 
 const JOB_PATH_REGEX = /\/job\/[^/?#]+\/[^/?#]+-job\d+/i;
 const JOB_DETAIL_REGEX = /^https?:\/\/(?:www\.)?totaljobs\.com\/job\/[^/?#]+\/[^/?#]+-job\d+/i;
@@ -179,13 +181,23 @@ const injectDynamicHeaders = (options) => {
 async function warmUpSite(proxyConf) {
   try {
     const proxyUrl = proxyConf ? await proxyConf.newUrl() : undefined;
+    
+    // Force HTTP/1.1 for warmup
+    const httpsAgent = new https.Agent({
+      keepAlive: true,
+      rejectUnauthorized: false,
+    });
+    
     const response = await gotScraping({
       url: 'https://www.totaljobs.com/',
       proxyUrl,
       timeout: { request: 15000 },
       retry: { limit: 1 },
       headers: headerGenerator.getHeaders(),
+      agent: { https: httpsAgent },
+      http2: false,  // Force HTTP/1.1
     });
+    
     const setCookie = response.headers['set-cookie'];
     if (setCookie) {
       warmupCookieHeader = Array.isArray(setCookie)
@@ -269,32 +281,65 @@ async function main() {
         const failedUrls = new Set();
         let shouldAbort = false;
 
-        // Determine optimal concurrency based on user input or defaults
+        // Create HTTP/1.1 agents to avoid HTTP/2 errors
+        const httpAgent = new http.Agent({
+            keepAlive: true,
+            keepAliveMsecs: 30000,
+            maxSockets: 50,
+            maxFreeSockets: 10,
+            timeout: 30000,
+        });
+        
+        const httpsAgent = new https.Agent({
+            keepAlive: true,
+            keepAliveMsecs: 30000,
+            maxSockets: 50,
+            maxFreeSockets: 10,
+            timeout: 30000,
+            rejectUnauthorized: false,
+        });
+
+        // Determine optimal concurrency - REDUCED to avoid overwhelming server
         const maxConcurrency = Number.isFinite(+input.maxConcurrency)
-            ? Math.max(1, Math.min(12, +input.maxConcurrency))
-            : 8;
+            ? Math.max(1, Math.min(8, +input.maxConcurrency))
+            : 4;  // Reduced from 8 to 4 for better stability
         
         // Stealth best practices: optimized speed with maintained stealth
         const crawler = new CheerioCrawler({
             requestQueue,
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 4,
+            maxRequestRetries: 5,  // Increased from 4 to 5
             useSessionPool: true,
             sessionPoolOptions: {
-                maxPoolSize: 100,
+                maxPoolSize: 50,  // Reduced from 100
                 sessionOptions: {
-                    maxUsageCount: 20,
-                    maxErrorScore: 3,
+                    maxUsageCount: 10,  // Reduced from 20 for fresher sessions
+                    maxErrorScore: 2,  // Reduced from 3 for stricter session quality
                 },
             },
             maxConcurrency: maxConcurrency,
-            minConcurrency: Math.max(1, Math.floor(maxConcurrency / 2)),
+            minConcurrency: 1,  // Start with 1 to be conservative
             requestHandlerTimeoutSecs: 60,
             navigationTimeoutSecs: 45,
-            maxRequestsPerMinute: 220,
+            maxRequestsPerMinute: 120,  // Reduced from 220 to be less aggressive
             ignoreSslErrors: true,
             persistCookiesPerSession: true,
             additionalMimeTypes: ['application/json'],
+            // CRITICAL: Force HTTP/1.1 at got-scraping level to prevent HTTP/2 errors
+            requestOptions: {
+                agent: {
+                    http: httpAgent,
+                    https: httpsAgent,
+                },
+                http2: false,  // Explicitly disable HTTP/2
+                timeout: {
+                    request: 30000,
+                    response: 30000,
+                },
+                retry: {
+                    limit: 0,  // Let Crawlee handle retries
+                },
+            },
             preNavigationHooks: [
                 async ({ request, session, crawler: crawlerInstance }) => {
                     // Abort if target reached
@@ -314,22 +359,22 @@ async function main() {
                     const delayBase = retryCount > 0
                         ? getBackoffDelay(retryCount)
                         : isListPage 
-                            ? Math.floor(Math.random() * 800) + 1200  // 1200-2000ms for list pages
-                            : Math.floor(Math.random() * 400) + 700;  // 700-1100ms for detail pages
+                            ? Math.floor(Math.random() * 1000) + 1500  // 1500-2500ms for list pages
+                            : Math.floor(Math.random() * 500) + 800;  // 800-1300ms for detail pages
                     
-                    await randomDelay(delayBase, delayBase + 600);
+                    await randomDelay(delayBase, delayBase + 700);
                     
                     if (session && retryCount > 2) {
                         session.markBad();
                     }
                 },
             ],
-            // Force HTTP/1.1 to avoid HTTP/2 NGHTTP2_INTERNAL_ERROR
-            requestHandlerOptions: {
-                http2: false,
-            },
 
-            async requestHandler({ request, $, session, log: crawlerLog, crawler: crawlerInstance }) {
+            async requestHandler({ request, $, session, log: crawlerLog, crawler: crawlerInstance, response }) {
+                // Log HTTP version to verify HTTP/1.1 is being used
+                const httpVersion = response?.httpVersion || 'unknown';
+                crawlerLog.debug(`HTTP version: ${httpVersion} for ${request.url}`);
+                
                 // Early abort check
                 if (shouldAbort || saved >= RESULTS_WANTED) {
                     crawlerLog.info(`Skipping request - target reached (${saved}/${RESULTS_WANTED})`);
@@ -728,10 +773,11 @@ if (isListPage) {
                 
                 const message = error?.message || 'Unknown error';
                 const is403or429 = message.includes('403') || message.includes('429');
-                const isNetworkError = message.includes('NGHTTP2') || message.includes('socket') ||
+                const isNetworkError = message.includes('NGHTTP2') || message.includes('HTTP/2') ||
+                                      message.includes('socket') || message.includes('Stream closed') ||
                                       message.includes('ECONNRESET') || message.includes('ETIMEDOUT') ||
                                       message.includes('ENOTFOUND') || message.includes('EAI_AGAIN') ||
-                                      message.includes('Stream closed');
+                                      message.includes('early terminated');
                 const isListPage = request.userData?.isListPage || LIST_PATH_REGEX.test(new URL(request.url).pathname);
 
                 if (is403or429) {
@@ -772,36 +818,66 @@ if (isListPage) {
                     if (session) {
                         session.retire();
                     }
-                    await randomDelay(3000, 5000);
+                    await randomDelay(3000, 6000);
                     
-                    // Retry list pages with manual URL construction
-                    if (isListPage && !shouldAbort) {
+                    // CRITICAL: Always retry list pages - don't let pagination stop
+                    if (isListPage && !shouldAbort && saved < RESULTS_WANTED) {
                         const fallbackPageNum = request.userData?.pageNum
                             || (request.url.includes('page=')
                                 ? Number(new URL(request.url).searchParams.get('page'))
                                 : null)
                             || 1;
-                        const manualUrl = buildPageUrl(request.url, fallbackPageNum);
-                        const retryKey = `${manualUrl}#network-retry-${request.retryCount}`;
                         
-                        if (!seenPageUrls.has(retryKey) && request.retryCount >= 3) {
-                            seenPageUrls.add(retryKey);
-                            const retryReq = {
-                                url: manualUrl,
-                                uniqueKey: retryKey,
-                                userData: {
-                                    referer: request.userData?.referer || 'https://www.totaljobs.com/',
-                                    isListPage: true,
-                                    pageNum: fallbackPageNum,
-                                },
-                                headers: { 
-                                    referer: request.userData?.referer || 'https://www.totaljobs.com/',
-                                    'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
-                                },
-                            };
-                            injectDynamicHeaders(retryReq);
-                            await requestQueue.addRequest(retryReq);
-                            crawlerLog.info(`🔄 Re-enqueued list page ${fallbackPageNum} after network error`);
+                        // If this was the last retry, still try to queue next page to continue
+                        if (request.retryCount >= 4) {
+                            crawlerLog.warning(`⚠️ Page ${fallbackPageNum} failed completely, trying to skip to next page`);
+                            const nextPageNum = fallbackPageNum + 1;
+                            const skipUrl = buildPageUrl(request.url, nextPageNum);
+                            const skipKey = `${skipUrl}#skip-failed-${fallbackPageNum}`;
+                            
+                            if (!seenPageUrls.has(skipKey) && nextPageNum <= MAX_PAGES) {
+                                seenPageUrls.add(skipKey);
+                                const skipReq = {
+                                    url: skipUrl,
+                                    uniqueKey: skipKey,
+                                    userData: {
+                                        referer: 'https://www.totaljobs.com/',
+                                        isListPage: true,
+                                        pageNum: nextPageNum,
+                                    },
+                                    headers: { 
+                                        referer: 'https://www.totaljobs.com/',
+                                        'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
+                                    },
+                                };
+                                injectDynamicHeaders(skipReq);
+                                await requestQueue.addRequest(skipReq);
+                                crawlerLog.info(`🔄 Skipped failed page, enqueued page ${nextPageNum} to continue`);
+                            }
+                        } else {
+                            // Regular retry for this page
+                            const manualUrl = buildPageUrl(request.url, fallbackPageNum);
+                            const retryKey = `${manualUrl}#network-retry-${request.retryCount}`;
+                            
+                            if (!seenPageUrls.has(retryKey)) {
+                                seenPageUrls.add(retryKey);
+                                const retryReq = {
+                                    url: manualUrl,
+                                    uniqueKey: retryKey,
+                                    userData: {
+                                        referer: request.userData?.referer || 'https://www.totaljobs.com/',
+                                        isListPage: true,
+                                        pageNum: fallbackPageNum,
+                                    },
+                                    headers: { 
+                                        referer: request.userData?.referer || 'https://www.totaljobs.com/',
+                                        'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
+                                    },
+                                };
+                                injectDynamicHeaders(retryReq);
+                                await requestQueue.addRequest(retryReq);
+                                crawlerLog.info(`🔄 Re-enqueued list page ${fallbackPageNum} after network error`);
+                            }
                         }
                     }
                 } else {
