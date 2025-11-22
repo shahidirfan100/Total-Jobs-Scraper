@@ -315,6 +315,13 @@ async function main() {
                     request: 30000,
                     response: 30000,
                 };
+                // Safeguard: ensure no http2 agent leaks in (proxy hook sometimes injects it)
+                gotScraping.defaults.options.hooks ??= {};
+                gotScraping.defaults.options.hooks.beforeRequest ??= [];
+                gotScraping.defaults.options.hooks.beforeRequest.push((options) => {
+                    if (options.agent?.http2) delete options.agent.http2;
+                    options.http2 = false;
+                });
             }
         } catch (err) {
             log.warning(`Could not apply HTTP/1.1 defaults: ${err.message}`);

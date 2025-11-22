@@ -15,7 +15,7 @@
       "type": "string",
       "description": "Job search keyword(s), e.g., 'Software Developer', 'Marketing Manager', 'Data Analyst'.",
       "editor": "textfield",
-      "prefill": "software engineer"
+      "prefill": "admin"
     },
     "location": {
       "title": "Location (if not using Start URL)",
