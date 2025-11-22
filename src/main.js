@@ -13,6 +13,7 @@ process.env.NODE_OPTIONS = (process.env.NODE_OPTIONS || '') + ' --no-deprecation
 const JOB_PATH_REGEX = /\/job\/[^/?#]+\/[^/?#]+-job\d+/i;
 const JOB_DETAIL_REGEX = /^https?:\/\/(?:www\.)?totaljobs\.com\/job\/[^/?#]+\/[^/?#]+-job\d+/i;
 const LIST_PATH_REGEX = /\/jobs\//i;
+const MAX_QA_RUNTIME_MS = 280_000; // Hard limit to keep QA runs under 5 minutes
 
 // Selector documentation based on actual Totaljobs.com structure (Nov 2025)
 // LISTING PAGE: Job links found as: <a href="/job/[title]/[company]-job[id]">
@@ -283,6 +284,9 @@ async function main() {
         const seenPageUrls = new Set(startRequests.map((req) => req.url));
         const failedUrls = new Set();
         let shouldAbort = false;
+        const runStart = Date.now();
+
+        const isTimeBudgetExceeded = () => (Date.now() - runStart) >= MAX_QA_RUNTIME_MS;
 
         // Create HTTP/1.1 agents to avoid HTTP/2 errors
         const httpAgent = new http.Agent({
@@ -301,6 +305,20 @@ async function main() {
             timeout: 30000,
             rejectUnauthorized: false,
         });
+
+        // Enforce HTTP/1.1 globally for got-scraping to avoid NGHTTP2 failures
+        try {
+            if (gotScraping?.defaults?.options) {
+                gotScraping.defaults.options.http2 = false;
+                gotScraping.defaults.options.agent = { http: httpAgent, https: httpsAgent };
+                gotScraping.defaults.options.timeout = {
+                    request: 30000,
+                    response: 30000,
+                };
+            }
+        } catch (err) {
+            log.warning(`Could not apply HTTP/1.1 defaults: ${err.message}`);
+        }
 
         // Determine optimal concurrency - REDUCED to avoid overwhelming server
         const maxConcurrency = Number.isFinite(+input.maxConcurrency)
@@ -330,6 +348,14 @@ async function main() {
             additionalMimeTypes: ['application/json'],
             preNavigationHooks: [
                 async ({ request, session, crawler: crawlerInstance }) => {
+                    // Respect QA time budget
+                    if (isTimeBudgetExceeded()) {
+                        shouldAbort = true;
+                        log.warning(`Time budget (${MAX_QA_RUNTIME_MS} ms) reached, aborting new work`);
+                        await crawlerInstance.autoscaledPool?.abort();
+                        return;
+                    }
+
                     // Abort if target reached
                     if (shouldAbort || saved >= RESULTS_WANTED) {
                         log.info(`Aborting request - target reached: ${request.url}`);
@@ -370,6 +396,13 @@ async function main() {
                 const httpVersion = response?.httpVersion || 'unknown';
                 crawlerLog.debug(`HTTP version: ${httpVersion} for ${request.url}`);
                 
+                if (isTimeBudgetExceeded()) {
+                    shouldAbort = true;
+                    crawlerLog.warning(`Time budget hit, skipping ${request.url}`);
+                    await crawlerInstance.autoscaledPool?.abort();
+                    return;
+                }
+
                 // Early abort check
                 if (shouldAbort || saved >= RESULTS_WANTED) {
                     crawlerLog.info(`Skipping request - target reached (${saved}/${RESULTS_WANTED})`);
