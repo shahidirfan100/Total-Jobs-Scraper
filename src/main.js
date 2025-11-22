@@ -247,15 +247,28 @@ async function main() {
             return u.href;
         };
 
+        const isValidUrl = (value) => {
+            if (!value || typeof value !== 'string') return false;
+            try {
+                new URL(value);
+                return true;
+            } catch {
+                return false;
+            }
+        };
+
         const initial = [];
-        if (startUrl) initial.push(startUrl);
-        else if (url) initial.push(url);
+        if (startUrl && isValidUrl(startUrl)) initial.push(startUrl);
+        else if (url && isValidUrl(url)) initial.push(url);
         else initial.push(buildStartUrl(keyword, location, category, postedWithin));
 
         log.info(`TotalJobs scraper started with ${initial.length} start URL(s)`);
         log.info(`Target: ${RESULTS_WANTED} jobs, max ${MAX_PAGES} pages, collectDetails: ${collectDetails}`);
 
         const startRequests = initial.map((currentUrl) => {
+            if (!isValidUrl(currentUrl)) {
+                throw new Error(`Invalid start URL resolved from input: ${currentUrl}`);
+            }
             const request = {
                 url: currentUrl,
                 userData: { referer: 'https://www.totaljobs.com/', isListPage: true, pageNum: 1 },
