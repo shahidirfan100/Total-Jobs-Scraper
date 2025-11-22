@@ -323,16 +323,35 @@ async function main() {
         try {
             if (gotScraping?.defaults?.options) {
                 gotScraping.defaults.options.http2 = false;
-                gotScraping.defaults.options.agent = { http: httpAgent, https: httpsAgent };
-                gotScraping.defaults.options.timeout = {
-                    request: 30000,
-                    response: 30000,
-                };
-                // Safeguard: ensure no http2 agent leaks in (proxy hook sometimes injects it)
                 gotScraping.defaults.options.hooks ??= {};
                 gotScraping.defaults.options.hooks.beforeRequest ??= [];
+
+                // Wrap existing proxy hook to avoid injecting agent.http2
+                gotScraping.defaults.options.hooks.beforeRequest = gotScraping.defaults.options.hooks.beforeRequest.map((fn) => {
+                    if (fn?.name === 'proxyHook') {
+                        return async (options) => {
+                            try {
+                                options.http2 = false;
+                                await fn(options);
+                                if (options.agent?.http2) delete options.agent.http2;
+                                options.agent = { http: httpAgent, https: httpsAgent };
+                            } catch (err) {
+                                if (String(err.message || '').includes('Unexpected agent option: http2')) {
+                                    options.agent = { http: httpAgent, https: httpsAgent };
+                                    options.http2 = false;
+                                    return;
+                                }
+                                throw err;
+                            }
+                        };
+                    }
+                    return fn;
+                });
+
+                // Final guard to enforce HTTP/1.1 agents
                 gotScraping.defaults.options.hooks.beforeRequest.push((options) => {
                     if (options.agent?.http2) delete options.agent.http2;
+                    options.agent = { http: httpAgent, https: httpsAgent };
                     options.http2 = false;
                 });
             }
